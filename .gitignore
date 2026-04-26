@@ -1,0 +1,13 @@
+# Model files (too large for git)
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+*.mlpackage
+
+# Build artifacts
+target/
+Cargo.lock
+models/

@@ -1,0 +1,12 @@
+image: rust:latest
+
+stages:
+  - test
+
+check:
+  stage: test
+  script:
+    - rustup component add rustfmt clippy
+    - cargo fmt --all -- --check
+    - cargo clippy --workspace --all-targets -- -D warnings
+    - cargo test --workspace

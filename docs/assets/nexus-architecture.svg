@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="520" viewBox="0 0 1120 520" role="img" aria-labelledby="title desc">
+  <title id="title">Nexus inference engine architecture</title>
+  <desc id="desc">Layered overview of the Nexus runtime, quantization, memory, backend, and tooling stack.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#101820"/>
+      <stop offset="52%" stop-color="#18242d"/>
+      <stop offset="100%" stop-color="#20313a"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#54d2b7"/>
+      <stop offset="100%" stop-color="#7fb6ff"/>
+    </linearGradient>
+    <style>
+      .title { font: 700 34px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #f7fbff; }
+      .subtitle { font: 500 15px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #b7c7d4; }
+      .layer-title { font: 700 16px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #f7fbff; }
+      .body { font: 500 13px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #d8e4ec; }
+      .small { font: 500 12px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #a9bac7; }
+      .panel { fill: rgba(255,255,255,0.07); stroke: rgba(255,255,255,0.18); stroke-width: 1; rx: 8; }
+      .chip { fill: rgba(255,255,255,0.1); stroke: rgba(255,255,255,0.2); stroke-width: 1; rx: 6; }
+      .line { stroke: #7fb6ff; stroke-width: 2; stroke-linecap: round; opacity: 0.7; }
+    </style>
+  </defs>
+  <rect width="1120" height="520" fill="url(#bg)"/>
+  <rect x="36" y="34" width="1048" height="452" rx="18" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.14)"/>
+  <text x="68" y="86" class="title">Nexus</text>
+  <text x="68" y="114" class="subtitle">Rust inference prototype combining GGUF loading, tokenizer metadata, K-quant weights, packed KV cache, scheduling, and OpenAI-compatible serving.</text>
+  <rect x="66" y="142" width="988" height="8" rx="4" fill="url(#accent)"/>
+
+  <g transform="translate(66 178)">
+    <rect class="panel" x="0" y="0" width="196" height="112"/>
+    <text class="layer-title" x="18" y="30">API and Tools</text>
+    <rect class="chip" x="18" y="48" width="70" height="28"/>
+    <text class="small" x="36" y="67">CLI</text>
+    <rect class="chip" x="96" y="48" width="82" height="28"/>
+    <text class="small" x="112" y="67">Server</text>
+    <text class="body" x="18" y="96">OpenAI API, bench, golden</text>
+  </g>
+
+  <g transform="translate(282 178)">
+    <rect class="panel" x="0" y="0" width="196" height="112"/>
+    <text class="layer-title" x="18" y="30">Runtime</text>
+    <text class="body" x="18" y="58">LLaMA decode path</text>
+    <text class="body" x="18" y="80">Speculative verify</text>
+    <text class="body" x="18" y="102">MoE routed FFN helper</text>
+  </g>
+
+  <g transform="translate(498 178)">
+    <rect class="panel" x="0" y="0" width="196" height="112"/>
+    <text class="layer-title" x="18" y="30">Quantization</text>
+    <text class="body" x="18" y="58">Q4_0, Q8_0, Q4_K, Q2_K</text>
+    <text class="body" x="18" y="80">Packed low-bit KV</text>
+    <text class="body" x="18" y="102">Direct KV attention reads</text>
+  </g>
+
+  <g transform="translate(714 178)">
+    <rect class="panel" x="0" y="0" width="196" height="112"/>
+    <text class="layer-title" x="18" y="30">Memory</text>
+    <text class="body" x="18" y="58">Unified pool model</text>
+    <text class="body" x="18" y="80">Per-request KV pages</text>
+    <text class="body" x="18" y="102">Capacity accounting</text>
+  </g>
+
+  <g transform="translate(930 178)">
+    <rect class="panel" x="0" y="0" width="124" height="112"/>
+    <text class="layer-title" x="18" y="30">Backends</text>
+    <text class="body" x="18" y="58">CPU SIMD</text>
+    <text class="body" x="18" y="80">Metal probe</text>
+    <text class="small" x="18" y="102">CUDA planned</text>
+  </g>
+
+  <line class="line" x1="262" y1="234" x2="282" y2="234"/>
+  <line class="line" x1="478" y1="234" x2="498" y2="234"/>
+  <line class="line" x1="694" y1="234" x2="714" y2="234"/>
+  <line class="line" x1="910" y1="234" x2="930" y2="234"/>
+
+  <g transform="translate(66 330)">
+    <rect class="panel" x="0" y="0" width="304" height="96"/>
+    <text class="layer-title" x="18" y="30">Model Ingestion</text>
+    <text class="body" x="18" y="58">Safetensors and MLX shards convert to GGUF v3</text>
+    <text class="small" x="18" y="80">Tokenizer metadata, chat templates, and K-quants included</text>
+  </g>
+  <g transform="translate(408 330)">
+    <rect class="panel" x="0" y="0" width="304" height="96"/>
+    <text class="layer-title" x="18" y="30">Serving Loop</text>
+    <text class="body" x="18" y="58">Request scheduler admits decode batches</text>
+    <text class="small" x="18" y="80">KV pages are assigned and released per request</text>
+  </g>
+  <g transform="translate(750 330)">
+    <rect class="panel" x="0" y="0" width="304" height="96"/>
+    <text class="layer-title" x="18" y="30">Verification</text>
+    <text class="body" x="18" y="58">Workspace tests, clippy, formatting, golden logits</text>
+    <text class="small" x="18" y="80">Benchmark matrix reports throughput by prompt length</text>
+  </g>
+</svg>

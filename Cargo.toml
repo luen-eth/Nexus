@@ -1,0 +1,79 @@
+[package]
+name = "nexus"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance AI inference engine combining TurboQuant, llama.cpp, and MLX best practices"
+authors = ["Nexus Contributors"]
+license = "MIT"
+rust-version = "1.75"
+
+[workspace]
+members = [".", "tools/nexus-convert"]
+
+[dependencies]
+# Serialization
+bincode = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# HTTP Server
+axum = { version = "0.7", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+
+# SIMD / Math
+bytemuck = "1.14"
+num-traits = "0.2"
+rand = "0.8"
+rayon = "1.10"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Metal (Apple Silicon) - optional
+metal = { version = "0.29", optional = true }
+
+# Utilities
+anyhow = "1.0"
+thiserror = "2.0"
+memmap2 = "0.9"
+dirs = "5.0"
+num_cpus = "1.16"
+
+# HTTP / Download
+reqwest = { version = "0.11", features = ["stream"] }
+futures-util = "0.3"
+
+# FP16 support for MLX
+half = "2.4"
+
+# Compression for GGUF
+flate2 = "1.0"
+
+# UUID for request IDs
+uuid = { version = "1.0", features = ["v4"] }
+
+# Time
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[features]
+default = ["cpu-simd", "metal"]
+cpu-simd = []
+metal = ["dep:metal"]
+cuda = []
+all-backends = ["cpu-simd", "metal", "cuda"]
+
+[[bin]]
+name = "nexus"
+path = "src/cli/main.rs"
+
+[[bin]]
+name = "nexus-server"
+path = "src/server/main.rs"
+
