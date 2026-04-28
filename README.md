@@ -108,7 +108,7 @@ flowchart LR
 | API | `/v1/chat/completions`, `/v1/models`, prompt rendering from full message list, streaming SSE chunks |
 | Sampling | Greedy, temperature, top-p, top-k, repetition penalty, seed, stop sequences |
 | Scheduler | Pending/running/completed lifecycle, decode batches, generated-token append, per-request KV page assignment |
-| Converter | safetensors/MLX shards to GGUF v3 for F32/F16/Q8_0/Q4_0/Q4_K/Q2_K, tokenizer metadata import |
+| Converter | safetensors/MLX shards to GGUF v3 for F32/F16/Q8_0/Q4_0/Q4_K/Q2_K, tokenizer metadata import, output validation, quantization error reporting |
 | Backends | CPU execution path, Metal capability probe, explicit unavailable CUDA/Vulkan/WebGPU capabilities |
 | Benchmarks | CLI throughput matrix with text/JSON output and golden logits reports |
 
@@ -127,7 +127,18 @@ cargo run --bin nexus -- info --model path/to/model.gguf
 cargo run --bin nexus -- run --model path/to/model.gguf --prompt "Hello" --max-tokens 32
 cargo run --bin nexus -- bench --model path/to/model.gguf --prompt-lens 128,512,2048 --iterations 3 --max-tokens 64 --json
 cargo run --bin nexus -- golden --model path/to/model.gguf --prompt "Hello" --top-k 10 --output golden.json
+cargo run --bin nexus-server -- --model path/to/model.gguf --port 8080
 cargo run -p nexus-convert -- --input path/to/hf-model-dir --output model.gguf --quant q4-k
+```
+
+## Server Endpoints
+
+```text
+POST /v1/chat/completions  OpenAI-compatible chat completion API with token SSE streaming
+GET  /v1/models            OpenAI-compatible model list
+GET  /v1/model             Loaded model, backend, quantization, and dimension details
+GET  /health               Model-load health status
+GET  /metrics              Scheduler, KV page, backend, and model runtime counters
 ```
 
 ## Development Checks

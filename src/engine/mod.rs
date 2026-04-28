@@ -1178,6 +1178,22 @@ impl InferenceEngine {
         prompt: &[u32],
         generation: &GenerationConfig,
     ) -> Result<Vec<u32>, String> {
+        self.generate_with_config_streaming(prompt, generation, |_, _| Ok(()))
+    }
+
+    /// Generate text and call `on_token` whenever a generated token is accepted.
+    ///
+    /// The callback runs synchronously on the generation thread. Returning an
+    /// error stops generation and propagates that error to the caller.
+    pub fn generate_with_config_streaming<F>(
+        &mut self,
+        prompt: &[u32],
+        generation: &GenerationConfig,
+        mut on_token: F,
+    ) -> Result<Vec<u32>, String>
+    where
+        F: FnMut(u32, &[u32]) -> Result<(), String>,
+    {
         let mut output = prompt.to_vec();
 
         let mut logits = self.prefill(prompt)?;
@@ -1195,6 +1211,7 @@ impl InferenceEngine {
                 output.truncate(new_len);
                 break;
             }
+            on_token(next_token, &output)?;
 
             let position = output.len() - 1;
             logits = match self.decode_with_cache(next_token, position) {

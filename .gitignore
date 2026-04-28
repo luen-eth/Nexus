@@ -9,5 +9,4 @@
 
 # Build artifacts
 target/
-Cargo.lock
 models/

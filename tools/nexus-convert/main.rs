@@ -3,13 +3,14 @@
 
 #![allow(non_camel_case_types)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use nexus::gguf::GgufReader;
 use nexus::mlx::MlxModelLoader;
 use nexus::quant::{KvQuantType, QuantEngine, QuantFormat as NexusQuantFormat};
 
@@ -58,6 +59,34 @@ struct ConvertedTensor {
     offset: u64,
 }
 
+#[derive(Debug, Default)]
+struct QuantizationSummary {
+    tensors: usize,
+    values: usize,
+    total_abs_error: f64,
+    max_abs_error: f32,
+}
+
+impl QuantizationSummary {
+    fn record(&mut self, original: &[f32], reconstructed: &[f32]) {
+        self.tensors += 1;
+        for (expected, actual) in original.iter().zip(reconstructed) {
+            let error = (expected - actual).abs();
+            self.total_abs_error += error as f64;
+            self.max_abs_error = self.max_abs_error.max(error);
+            self.values += 1;
+        }
+    }
+
+    fn mean_abs_error(&self) -> f64 {
+        if self.values == 0 {
+            0.0
+        } else {
+            self.total_abs_error / self.values as f64
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -91,6 +120,8 @@ fn main() -> Result<()> {
     let quant_engine = QuantEngine::new(quant_format, KvQuantType::None);
 
     let mut tensors = Vec::new();
+    let mut names = HashSet::new();
+    let mut quantization = QuantizationSummary::default();
     let mut offset = 0u64;
     for name in loader.tensor_names() {
         let meta = loader
@@ -99,11 +130,39 @@ fn main() -> Result<()> {
         let values = loader
             .load_tensor(name)
             .with_context(|| format!("Failed to load tensor {}", name))?;
+        if values.len() != meta.num_elements() {
+            anyhow::bail!(
+                "Tensor {} shape/data mismatch: metadata says {} elements, loaded {}",
+                name,
+                meta.num_elements(),
+                values.len()
+            );
+        }
+
+        let canonical_name = canonical_tensor_name(name);
+        if !names.insert(canonical_name.clone()) {
+            anyhow::bail!(
+                "Tensor name collision after canonicalization: {} -> {}",
+                name,
+                canonical_name
+            );
+        }
+
         let data = quant_engine.quantize_weights(&values);
+        let reconstructed = quant_engine.dequantize(&data, values.len());
+        if reconstructed.len() != values.len() {
+            anyhow::bail!(
+                "Tensor {} quantization roundtrip length mismatch: got {}, expected {}",
+                name,
+                reconstructed.len(),
+                values.len()
+            );
+        }
+        quantization.record(&values, &reconstructed);
         let aligned_size = align(data.len(), ALIGNMENT);
 
         tensors.push(ConvertedTensor {
-            name: canonical_tensor_name(name),
+            name: canonical_name,
             shape: meta.shape.clone(),
             gguf_type,
             data,
@@ -114,8 +173,16 @@ fn main() -> Result<()> {
 
     let metadata = build_metadata(&loader, &cli.input, cli.turboquant)?;
     write_gguf(&cli.output, &metadata, &tensors)?;
+    validate_written_gguf(&cli.output, tensors.len())?;
     println!("Wrote GGUF: {}", cli.output.display());
     println!("Tensors: {}", tensors.len());
+    println!("Validation: ok (GGUF parsed, tensor table matches conversion output)");
+    println!(
+        "Quantization error: mean_abs={:.6}, max_abs={:.6} over {} values",
+        quantization.mean_abs_error(),
+        quantization.max_abs_error,
+        quantization.values
+    );
 
     Ok(())
 }
@@ -312,6 +379,34 @@ fn write_gguf(
         pad_to_alignment(&mut writer, ALIGNMENT)?;
     }
     writer.flush()?;
+    Ok(())
+}
+
+fn validate_written_gguf(path: &Path, expected_tensors: usize) -> Result<()> {
+    let metadata = GgufReader::parse_file(path)
+        .with_context(|| format!("Failed to validate written GGUF {}", path.display()))?;
+    if metadata.version != GGUF_VERSION {
+        anyhow::bail!(
+            "Written GGUF version mismatch: got {}, expected {}",
+            metadata.version,
+            GGUF_VERSION
+        );
+    }
+    if metadata.tensors.len() != expected_tensors
+        || metadata.tensor_count as usize != expected_tensors
+    {
+        anyhow::bail!(
+            "Written GGUF tensor count mismatch: table={}, header={}, expected={}",
+            metadata.tensors.len(),
+            metadata.tensor_count,
+            expected_tensors
+        );
+    }
+    for tensor in &metadata.tensors {
+        if tensor.shape.is_empty() || tensor.num_elements() == 0 {
+            anyhow::bail!("Written GGUF contains empty tensor shape: {}", tensor.name);
+        }
+    }
     Ok(())
 }
 
