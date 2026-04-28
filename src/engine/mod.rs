@@ -77,6 +77,9 @@ pub struct InferenceConfig {
     pub rope_freq_base: f32,
     /// RMS norm epsilon
     pub rms_norm_eps: f32,
+    /// Optional cap for eagerly materialized tensor elements.
+    /// Set to None to attempt loading all supported tensors.
+    pub max_loaded_tensor_elements: Option<usize>,
 }
 
 impl Default for InferenceConfig {
@@ -89,6 +92,7 @@ impl Default for InferenceConfig {
             backend: BackendType::default(),
             rope_freq_base: 1000000.0,
             rms_norm_eps: 1e-5,
+            max_loaded_tensor_elements: Some(10_000_000),
         }
     }
 }
@@ -598,7 +602,11 @@ impl InferenceEngine {
         let mut skipped_tensors = 0usize;
         for tensor_info in &metadata.tensors {
             let elements = tensor_info.num_elements();
-            if elements == 0 || elements > 10_000_000 {
+            if elements == 0
+                || config
+                    .max_loaded_tensor_elements
+                    .is_some_and(|limit| elements > limit)
+            {
                 skipped_tensors += 1;
                 continue;
             }

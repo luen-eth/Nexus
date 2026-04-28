@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use nexus::backend::BackendType;
 use nexus::engine::{InferenceConfig, InferenceEngine};
 use nexus::quant::{KvQuantType, QuantFormat};
+use nexus::server::ServerConfig;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -42,6 +43,22 @@ struct Cli {
     /// Backend to use
     #[arg(long, default_value = "auto")]
     backend: String,
+
+    /// Maximum tensor elements to eagerly load; 0 means no cap.
+    #[arg(long)]
+    max_loaded_tensor_elements: Option<usize>,
+
+    /// Optional API key. Also configurable through NEXUS_API_KEY.
+    #[arg(long, env = "NEXUS_API_KEY")]
+    api_key: Option<String>,
+
+    /// CORS allow-origin value. Also configurable through NEXUS_CORS_ORIGIN.
+    #[arg(long, env = "NEXUS_CORS_ORIGIN")]
+    cors_origin: Option<String>,
+
+    /// Per-minute request limit per forwarded IP. Also configurable through NEXUS_RATE_LIMIT_PER_MINUTE.
+    #[arg(long, env = "NEXUS_RATE_LIMIT_PER_MINUTE")]
+    rate_limit_per_minute: Option<usize>,
 }
 
 #[tokio::main]
@@ -70,6 +87,11 @@ async fn main() -> Result<()> {
         kv_quant: kv_quant_type,
         weight_format,
         backend: backend_type,
+        max_loaded_tensor_elements: match cli.max_loaded_tensor_elements {
+            Some(0) => None,
+            Some(value) => Some(value),
+            None => InferenceConfig::default().max_loaded_tensor_elements,
+        },
         ..Default::default()
     };
 
@@ -96,8 +118,15 @@ async fn main() -> Result<()> {
         println!("Load a model with --model <path>");
     }
 
+    let server_config = ServerConfig {
+        api_key: cli.api_key,
+        cors_origin: cli.cors_origin,
+        rate_limit_per_minute: cli.rate_limit_per_minute,
+    };
+
     // Start server
-    nexus::server::run_server(engine, &cli.host, cli.port).await?;
+    nexus::server::run_server_with_config(engine, &cli.host, cli.port, server_config, cli.model)
+        .await?;
 
     Ok(())
 }
