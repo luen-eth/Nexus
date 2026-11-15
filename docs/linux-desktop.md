@@ -1,6 +1,6 @@
 # Linux desktop and packages
 
-Nexus Desktop is a native Qt server manager with an English interface. It selects a GGUF model and CPU/CUDA backend, starts or stops the local server, manages model loading, and shows status, metrics and bounded logs. It can also connect to an existing loopback server. It does not provide a chat screen or download model weights.
+Nexus Desktop is a native Qt workspace with an English interface. Chat streams replies from the loaded model and shows server-reported output tokens, elapsed request time and average tokens per second below each answer. Models searches public Hugging Face GGUF repositories, downloads selected files and manages the local model library. Server retains CPU/CUDA settings, model loading, health, metrics and logs, and can start a native process or connect to an existing loopback server.
 
 ## Packages and supported systems
 
@@ -15,7 +15,9 @@ The GUI uses Python 3.11+ and PySide6 6.8+. Debian 13 provides the split [`pytho
 
 A `.deb` is not an Arch package. Arch-built engine binaries are not bundled into the `.deb`: their OpenSSL SONAME and glibc/libstdc++ symbol requirements belong to the Arch build environment. Debian-family users should build the engine on their target distribution or connect to an existing compatible local server. The native package manifest records the actual ELF `NEEDED`, GLIBC, GLIBCXX, CXXABI and GCC requirements. CUDA additionally needs an NVIDIA GPU/driver capable of loading the checked-in `sm_80` / PTX 9.4 kernel; CUDA toolkit/NVRTC is not required. The hardware acceptance in this work used an RTX 5070. CPU operation does not require an NVIDIA driver.
 
-## Verified runtime matrix (15 November 2026)
+Version 0.2.0 was additionally checked on Arch Linux with 42 GUI tests, extracted Arch/Deb package entrypoints and window lifecycle checks, and live Docker/CUDA chat. A public 145 MB SmolLM GGUF download was verified, loaded through the Models page and used for a streamed reply. Per-answer token counts come from the server; elapsed time includes queueing, prompt processing and transfer, so tokens/s is the average across the whole request.
+
+## Initial 0.1.0 runtime matrix (15 November 2026)
 
 | Environment | Packaged GUI checks |
 |---|---|
@@ -30,8 +32,8 @@ The GUI `.deb` tested in both containers matched the final artifact SHA-256. No 
 Arch, with generated package filenames substituted:
 
 ```sh
-sudo pacman -U ./nexus-engine-cuda-0.1.0-1-x86_64.pkg.tar.zst \
-  ./nexus-desktop-0.1.0-1-any.pkg.tar.zst
+sudo pacman -U ./nexus-engine-cuda-0.2.0-1-x86_64.pkg.tar.zst \
+  ./nexus-desktop-0.2.0-1-any.pkg.tar.zst
 nexus-desktop
 ```
 
@@ -40,7 +42,7 @@ Install either the CPU engine or CUDA-capable engine package; they provide the s
 Debian 13 / Ubuntu 26.04 with the required repositories enabled:
 
 ```sh
-sudo apt install ./nexus-desktop_0.1.0-1_all.deb
+sudo apt install ./nexus-desktop_0.2.0-1_all.deb
 nexus-desktop
 ```
 

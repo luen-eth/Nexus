@@ -11,7 +11,7 @@ From the repository root, build from source with Rust 1.88 and the locked depend
 ```bash
 docker --context default build --target runtime \
   --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
-  -t nexus-server:0.1.0-cuda .
+  -t nexus-server:0.2.0-cuda .
 ```
 
 The base images are pinned by digest. Debian package installation follows the distribution repositories, so this is not a claim of bit-for-bit reproducible native compilation. No CUDA toolkit or GPU is needed to compile the checked-in PTX path.
@@ -23,7 +23,7 @@ NEXUS_SERVER_SHA256="$(sha256sum target/release/nexus-server | cut -d ' ' -f 1)"
 docker --context default build --target prebuilt \
   --build-arg NEXUS_SERVER_SHA256="$NEXUS_SERVER_SHA256" \
   --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
-  -t nexus-server:0.1.0-cuda .
+  -t nexus-server:0.2.0-cuda .
 ```
 
 The build checks the binary hash and executes `--help` inside Debian 13 to detect missing libraries or incompatible libc/libstdc++ versions. The hash check verifies the selected file, not its origin; use a binary you have built and validated. The runtime executes as UID/GID 10001 by default. Compose overrides that with your host IDs for model-file access. Tini forwards Docker's stop signal to the server; SIGTERM termination returns exit code 143 and does not promise draining in-flight requests.

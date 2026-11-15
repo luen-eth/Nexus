@@ -19,6 +19,7 @@ class Settings:
     port: int = 8080
     batch_size: int = 1
     server_url: str = "http://127.0.0.1:8080"
+    models_dir: str = ""
 
 
 def config_path() -> Path:

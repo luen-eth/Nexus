@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 LABEL org.opencontainers.image.title="Nexus CUDA server" \
       org.opencontainers.image.source="https://github.com/luen-eth/Nexus" \
-      org.opencontainers.image.version="0.1.0" \
+      org.opencontainers.image.version="0.2.0" \
       org.opencontainers.image.licenses="Apache-2.0"
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 WORKDIR /app

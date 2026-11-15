@@ -1,7 +1,7 @@
 name: nexus
 services:
   nexus:
-    image: ${NEXUS_IMAGE:-nexus-server:0.1.0-cuda}
+    image: ${NEXUS_IMAGE:-nexus-server:0.2.0-cuda}
     pull_policy: never
     user: "${NEXUS_UID:-1000}:${NEXUS_GID:-1000}"
     devices:

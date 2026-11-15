@@ -1,6 +1,28 @@
 # Nexus Desktop
 
-An English-language Qt 6 desktop interface that starts `nexus-server` or connects to an existing local server. Requires Python **3.11+** and **PySide6 >=6.8,<7**. The interface provides model and executable selection, CPU/CUDA and KV format controls, context and port settings, model lifecycle actions, health and metrics, and the latest 600 log lines.
+An English-language Qt 6 desktop interface for chatting with local models, finding and downloading GGUF files, and managing `nexus-server`. It can start a local server process or connect to an existing server, including one running in Docker. Requires Python **3.11+** and **PySide6 >=6.8,<7**.
+
+The sidebar has **Chat**, **Models**, and **Server** pages; `Ctrl+1`, `Ctrl+2`, and `Ctrl+3` switch between them. Server controls include executable selection, CPU/CUDA and KV formats, context and port settings, model lifecycle actions, health and metrics, and the latest 600 log lines.
+
+## Chat
+
+Connect to a server and load a model, then choose the model reported by that server in **Chat**. This selector shows loaded models, not every file in the local library. Replies stream into the conversation while server polling remains responsive. **Enter** sends a message; **Shift+Enter** adds a line. **Max output** defaults to 128 tokens and is clamped to the model's context limit. The server checks whether the complete conversation and requested output fit; use **New chat** or reduce the output limit if the context is full.
+
+Every assistant reply has a compact statistics line: server-reported completion tokens, elapsed seconds, and tokens/s. Elapsed time covers the entire request, including network, queueing, prompt processing, and generation; tokens/s divides the reported completion count by that time. It is not a decoder-only benchmark. Interrupted replies and servers that omit usage show **Tokens unavailable**; the application never estimates counts from words, characters, or stream events.
+
+**Stop** cancels only the chat request and retains its partial text for inspection. Partial or failed replies are excluded from subsequent conversation history. **New chat** clears the conversation. History also resets when the connection, authentication, selected model, or model installation epoch changes, and when a load/reload/unload operation begins. Chat history is bounded and kept in memory; it is not written to settings or uploaded to Hugging Face. Messages are displayed as plain text, including model-generated links or HTML.
+
+## Models and downloads
+
+Use **Models** to search public GGUF repositories on Hugging Face, select a repository and file, then choose **Download selected file**. Results show file size and available architecture/integrity metadata. Gated and private repositories are not supported, and no Hugging Face token is requested. Search and download use separate background workers; they do not receive the local server's API key.
+
+Downloads are pinned to the repository commit returned by Hugging Face. Before a file appears in the local library, the downloader checks its expected byte length, SHA-256 when provided by Git LFS metadata, and bounded GGUF v2/v3 metadata. If the publisher does not provide a SHA-256, the UI explicitly reports that only size and GGUF structure can be checked. Downloads use temporary files and publish the result atomically; existing files are not overwritten. **Cancel download**, failures, and application shutdown discard incomplete downloads. Cancelled downloads restart from the beginning when retried.
+
+Select a file under **Your local models** and choose **Load selected model**. With a connected server, this loads the file using the current Server settings. Without a connection, the application fills the model path and opens **Server** so you can start or connect explicitly. **Refresh** rescans the library; it does not download anything.
+
+The library directory is the saved `models_dir` setting, otherwise `NEXUS_MODELS_DIR`, otherwise `$XDG_DATA_HOME/nexus/models` (default: `~/.local/share/nexus/models`). Downloaded files are organized as `owner/repository/commit/path/to/model.gguf`. The selected directory is saved in the XDG settings file. For Docker, use a library directory mounted at the **same absolute path** inside the container, with permissions readable by the server's configured UID/GID. A read-only container mount can still see files downloaded by the desktop application on the host. See the [Docker guide](../docs/docker.md) for server setup.
+
+A GGUF search result or successful download does not guarantee that Nexus can run the model. Current support requires a compatible LLaMA architecture, full-head unscaled RoPE, tokenizer, and tensor formats; the server performs final validation when loading. Split GGUF models are rejected. Runtime weights expand to F32, so compressed download size is not a RAM or VRAM requirement. Check the [validation notes](../docs/validation.md) before choosing larger models.
 
 ## Development
 

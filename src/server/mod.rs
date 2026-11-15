@@ -821,8 +821,13 @@ struct ChunkContext {
 }
 
 impl ChunkContext {
-    fn chunk(&self, text: Option<&str>, finish_reason: Option<&str>) -> String {
-        match self.kind {
+    fn chunk(
+        &self,
+        text: Option<&str>,
+        finish_reason: Option<&str>,
+        usage: Option<UsageStats>,
+    ) -> String {
+        let mut chunk = match self.kind {
             StreamKind::Chat => {
                 let delta = match text {
                     Some(text) => serde_json::json!({ "content": text }),
@@ -851,8 +856,11 @@ impl ChunkContext {
                     "finish_reason": finish_reason
                 }]
             }),
+        };
+        if let Some(usage) = usage {
+            chunk["usage"] = serde_json::json!(usage);
         }
-        .to_string()
+        chunk.to_string()
     }
 
     fn role_chunk(&self) -> String {
@@ -943,17 +951,29 @@ async fn stream_response(
                 }
                 match st.rx.recv().await {
                     Some(StreamEvent::Delta(text)) => {
-                        st.pending.push_back(st.ctx.chunk(Some(&text), None));
+                        st.pending.push_back(st.ctx.chunk(Some(&text), None, None));
                     }
-                    Some(StreamEvent::Finished { finish_reason, .. }) => {
-                        st.pending
-                            .push_back(st.ctx.chunk(None, Some(finish_reason.as_str())));
+                    Some(StreamEvent::Finished {
+                        finish_reason,
+                        prompt_tokens,
+                        completion_tokens,
+                    }) => {
+                        st.pending.push_back(st.ctx.chunk(
+                            None,
+                            Some(finish_reason.as_str()),
+                            Some(UsageStats {
+                                prompt_tokens,
+                                completion_tokens,
+                                total_tokens: prompt_tokens + completion_tokens,
+                            }),
+                        ));
                         st.pending.push_back("[DONE]".to_string());
                         st.done = true;
                     }
                     Some(StreamEvent::Error(err)) => {
                         st.pending.push_back(error_event(&err.message));
-                        st.pending.push_back(st.ctx.chunk(None, Some("error")));
+                        st.pending
+                            .push_back(st.ctx.chunk(None, Some("error"), None));
                         st.pending.push_back("[DONE]".to_string());
                         st.done = true;
                     }
@@ -1011,6 +1031,7 @@ fn lifecycle_response(status: &str, snapshot: &ModelSnapshot) -> Json<serde_json
         "loaded": snapshot.loaded,
         "backend": snapshot.backend.name(),
         "max_seq_len": snapshot.max_seq_len,
+        "epoch": snapshot.epoch,
     }))
 }
 
@@ -1228,6 +1249,7 @@ async fn model_info(State(state): State<ServerState>) -> Json<serde_json::Value>
     if let Some(object) = info.as_object_mut() {
         object.insert("id".to_string(), serde_json::json!(snapshot.name));
         object.insert("path".to_string(), serde_json::json!(snapshot.path));
+        object.insert("epoch".to_string(), serde_json::json!(snapshot.epoch));
     }
     Json(info)
 }
@@ -2311,6 +2333,15 @@ mod tests {
             .unwrap();
         assert_eq!(body["choices"][0]["text"], "Hé");
         assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        // Usage counts tokenizer output, not visible UTF-8 characters or SSE
+        // deltas; the withheld stop sequence is excluded just as in a whole response.
+        assert_eq!(body["usage"]["prompt_tokens"], 1);
+        assert_eq!(body["usage"]["completion_tokens"], 3);
+        assert_eq!(body["usage"]["total_tokens"], 4);
+        assert_eq!(chunks.last().unwrap()["usage"], body["usage"]);
+        assert!(chunks[..chunks.len() - 1]
+            .iter()
+            .all(|chunk| chunk.get("usage").is_none()));
 
         // Chat streaming: role chunk first, [DONE] last, and the concatenated
         // deltas equal the non-streaming chat answer.
@@ -2352,6 +2383,16 @@ mod tests {
             .unwrap();
         assert_eq!(whole["choices"][0]["message"]["content"], streamed);
         assert_eq!(whole["usage"]["completion_tokens"], 5);
+        let final_chunk: serde_json::Value =
+            serde_json::from_str(&payloads[payloads.len() - 2]).unwrap();
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "length");
+        assert_eq!(final_chunk["usage"], whole["usage"]);
+        assert!(payloads[..payloads.len() - 2].iter().all(|payload| {
+            serde_json::from_str::<serde_json::Value>(payload)
+                .unwrap()
+                .get("usage")
+                .is_none()
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2696,6 +2737,7 @@ mod tests {
         // No model yet.
         assert_eq!(get("/health").await.1["status"], "degraded");
         assert_eq!(get("/v1/models").await.1["data"], serde_json::json!([]));
+        assert_eq!(get("/v1/model").await.1["epoch"], 0);
         assert_eq!(post("/v1/completions", complete.clone()).await.0, 503);
         assert_eq!(post("/v1/model/reload", serde_json::json!({})).await.0, 400);
 
@@ -2710,6 +2752,7 @@ mod tests {
         assert_eq!(body["id"], "tiny-gguf");
         assert_eq!(body["max_seq_len"], 64);
         assert_eq!(body["backend"], "cpu-simd");
+        assert_eq!(body["epoch"], 1);
 
         let (_, info) = get("/v1/model").await;
         assert_eq!(info["id"], "tiny-gguf");
@@ -2718,6 +2761,7 @@ mod tests {
         assert_eq!(info["dimensions"]["hidden_size"], HIDDEN);
         assert_eq!(info["dimensions"]["vocab_size"], VOCAB);
         assert_eq!(info["path"], serde_json::json!(file.path()));
+        assert_eq!(info["epoch"], body["epoch"]);
         assert_eq!(get("/v1/models").await.1["data"][0]["id"], "tiny-gguf");
         assert_eq!(get("/health").await.1["status"], "ok");
 
@@ -2744,6 +2788,7 @@ mod tests {
             .unwrap()
             .contains("not implemented"));
         assert_eq!(get("/v1/model").await.1["id"], "tiny-gguf");
+        assert_eq!(get("/v1/model").await.1["epoch"], 1);
         let (status, again) = post("/v1/completions", complete.clone()).await;
         assert_eq!(status, 200);
         assert_eq!(again["choices"][0]["text"], first["choices"][0]["text"]);
@@ -2755,6 +2800,10 @@ mod tests {
         assert_eq!(body["status"], "reloaded");
         assert_eq!(body["id"], "tiny-gguf");
         assert_eq!(get("/metrics").await.1["model"]["epoch"], epoch + 1);
+        assert_eq!(body["epoch"], epoch + 1);
+        let (_, info) = get("/v1/model").await;
+        assert_eq!(info["epoch"], epoch + 1);
+        assert_eq!(info["path"], serde_json::json!(file.path()));
         let (_, reloaded) = post("/v1/completions", complete.clone()).await;
         assert_eq!(reloaded["choices"][0]["text"], first["choices"][0]["text"]);
 
@@ -2763,11 +2812,13 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body["id"], DEFAULT_MODEL_NAME);
         assert_eq!(body["loaded"], false);
+        assert_eq!(body["epoch"], epoch + 2);
         assert_eq!(post("/v1/completions", complete.clone()).await.0, 503);
         assert_eq!(get("/health").await.1["status"], "degraded");
         let (_, info) = get("/v1/model").await;
         assert_eq!(info["loaded"], false);
         assert_eq!(info["path"], serde_json::Value::Null);
+        assert_eq!(info["epoch"], body["epoch"]);
         assert_eq!(post("/v1/model/reload", serde_json::json!({})).await.0, 400);
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

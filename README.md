@@ -84,11 +84,11 @@ Explicit CUDA selection returns an error if the device or kernel fails. It never
 
 ## Desktop
 
-Nexus Desktop is a native Qt server manager for Linux. Choose a model and CPU/CUDA backend, start or stop your local server, manage model loading and inspect status, metrics and bounded logs. It can also attach to an existing loopback server without taking ownership of that process.
+Nexus Desktop is a native Qt workspace for Linux with Chat, Models and Server pages. Stream replies from a loaded model, inspect output tokens and timing, find public GGUF files on Hugging Face, and download them into your local library. Server settings manage a native process or connect to an existing local server, including Docker.
 
-![Nexus Desktop in its initial disconnected state, showing model settings, server controls and logs](docs/assets/nexus-desktop.png)
+![Nexus Desktop 0.2.0 in its initial disconnected Chat view](docs/assets/nexus-desktop.png)
 
-The interface is in English. The screenshot shows the actual application's initial state; no model is running. Arch Linux packages and a GUI-only Debian package are described in [Linux desktop installation](docs/linux-desktop.md). The desktop app manages the server; it is not a chat client or a model downloader.
+The interface is in English. The screenshot shows the actual application's initial state; no model is running. Arch Linux packages and a GUI-only Debian package are described in [Linux desktop installation](docs/linux-desktop.md). The desktop app includes streaming chat, per-answer token and timing details, public Hugging Face GGUF search and downloads, a local model library, and server management.
 
 To run the server in a Linux container with NVIDIA GPU access and connect the host desktop app, see [Docker setup](docs/docker.md).
 
