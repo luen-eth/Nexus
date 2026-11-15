@@ -240,7 +240,7 @@ class MainWindow(QMainWindow):
         batch_row.addWidget(self.batch)
         settings_box.addLayout(batch_row)
         actions = QHBoxLayout()
-        self.start_button = QPushButton("▶  Start server")
+        self.start_button = QPushButton("▶  Start local server")
         self.start_button.setObjectName("startButton")
         self.start_button.setProperty("primary", True)
         self.stop_button = QPushButton("Stop")
@@ -408,7 +408,13 @@ class MainWindow(QMainWindow):
         self.metric_hints[2].setText(f"{runtime.get('queued_requests', 0)} requests queued")
         self.metric_values[3].setText(bytes_label(c.metrics.get("engine", {}).get("host_weight_payload_bytes")))
         self.metric_view.setPlainText(json.dumps(c.metrics, ensure_ascii=False, indent=2)[:65536] if c.metrics else "Waiting for metrics…")
-        self.start_button.setEnabled(not c.owned and not c.probing and not c.stopping)
+        self.start_button.setEnabled(c.mode != "external" and not c.owned and not c.probing and not c.stopping)
+        self.start_button.setToolTip(
+            "Connected to an external server. Manage its process with its original launcher. "
+            "Disconnect before starting a separate local server."
+            if c.mode == "external" else
+            "Start a local nexus-server executable. To use a running Docker server, connect to its API address."
+        )
         self.stop_button.setEnabled(c.owned and not c.stopping)
         self.restart_button.setEnabled(c.owned and not c.stopping and not c.starting)
         self.connect_button.setEnabled(not c.owned and not c.probing)

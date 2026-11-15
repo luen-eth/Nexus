@@ -22,7 +22,7 @@ CPU execution and F32 KV storage are the defaults. CUDA requires a CUDA-enabled 
 
 ## Connections and process ownership
 
-Management connections are restricted to loopback HTTP addresses (`127.0.0.1`, `localhost`, `::1`). A server started by the application binds to `127.0.0.1`. The application stops only its own `QProcess`; **Disconnect** sends no signal to an external server. Closing the window first requests termination of an owned server, then kills it if shutdown is delayed, without blocking the UI thread.
+Management connections are restricted to loopback HTTP addresses (`127.0.0.1`, `localhost`, `::1`). A server started by the application binds to `127.0.0.1`. The application stops only its own `QProcess`; **Disconnect** sends no signal to an external server. **Start local server** is disabled while connected to an external server; disconnect before starting a separate local process. Closing the window first requests termination of an owned server, then kills it if shutdown is delayed, without blocking the UI thread.
 
 Each server started by the application receives a random API key through its process environment, never through command-line arguments. External connection keys remain in the masked field for the current session. With `--connect`, the key is read from `NEXUS_API_KEY` and removed from the application's environment. No API keys are saved in the settings file, and known keys are redacted from logs. To connect another client to a server started by the application, use **Copy API key**; the key changes whenever that server is restarted. XDG settings are written atomically with mode 0600 to `$XDG_CONFIG_HOME/nexus-desktop/settings.json` (default: `~/.config/nexus-desktop/settings.json`).
 

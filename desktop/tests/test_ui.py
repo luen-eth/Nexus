@@ -101,6 +101,40 @@ class ControllerTests(unittest.TestCase):
         owner.poll()
         self.assertTrue(until(lambda: bool(owner.health)))
 
+    def test_local_start_cannot_replace_an_external_connection(self):
+        owner = self.start()
+        client = ServerController()
+        self.children.append(client)
+        window = MainWindow(Settings(port=free_port()), client)
+        self.windows.append(window)
+        window.show()
+        client.connect_external(owner.api.base, owner.api.key)
+        self.assertTrue(until(lambda: bool(client.metrics)))
+        self.assertFalse(window.start_button.isEnabled())
+        owner_pid = owner.process.processId()
+        health, key, base = dict(client.health), client.api.key, client.api.base
+        errors = []
+        client.error.connect(errors.append)
+        # Cover the reported missing-binary error and a valid executable that
+        # would otherwise disconnect this client and begin a new port probe.
+        for binary in ["/does/not/exist/nexus-server", FAKE]:
+            with self.subTest(binary=binary):
+                window.binary.setText(binary)
+                window.start_server()  # Exercise a programmatic click as well.
+                self.assertEqual(client.mode, "external")
+                self.assertIsNone(client.process)
+                self.assertFalse(client.probing)
+                self.assertEqual(client.health, health)
+                self.assertEqual(client.api.key, key)
+                self.assertEqual(client.api.base, base)
+                self.assertTrue(client.timer.isActive())
+                self.assertEqual(errors, [])
+                self.assertEqual(list(client.logs), [])
+        self.assertTrue(owner.owned)
+        self.assertEqual(owner.process.processId(), owner_pid)
+        client.disconnect()
+        self.assertTrue(window.start_button.isEnabled())
+
     def test_occupied_port_is_not_taken_over(self):
         owner = self.start()
         other = ServerController()

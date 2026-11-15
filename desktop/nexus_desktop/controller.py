@@ -80,7 +80,7 @@ class ServerController(QObject):
         self.changed.emit()
 
     def start(self, settings: Settings):
-        if self.owned or self.probing or self.stopping:
+        if self.mode == "external" or self.owned or self.probing or self.stopping:
             return
         binary = settings.binary.strip() or discover_binary()
         resolved = shutil.which(binary) if binary and not Path(binary).is_absolute() else binary
