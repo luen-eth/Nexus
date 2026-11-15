@@ -260,6 +260,8 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._models_page())
         self.pages.addWidget(self._build_server_page(settings))
         self.hub_panel.model_selected.connect(self.load_model_from_hub)
+        self.hub_panel.model_deleted.connect(self.model_deleted_from_hub)
+        self.hub_panel.deletion_state_changed.connect(self.refresh)
         self.pages.currentChanged.connect(self._page_changed)
 
         for number, key in enumerate(self.PAGES, 1):
@@ -668,6 +670,8 @@ class MainWindow(QMainWindow):
         self.controller.connect_external(self.url.text(), self.key.text())
 
     def run_model_action(self, action):
+        if self.hub_panel.deletion_in_progress:
+            return
         self.notice.hide()
         if action == "load":
             self._pending_model = ""
@@ -679,6 +683,8 @@ class MainWindow(QMainWindow):
 
     def load_model_from_hub(self, path: str):
         """A downloaded file was chosen on the Models page."""
+        if self.hub_panel.deletion_in_progress:
+            return
         path = (path or "").strip()
         if not path:
             return
@@ -692,12 +698,29 @@ class MainWindow(QMainWindow):
         self.select_page("server")
         self.refresh()
 
+    def model_deleted_from_hub(self, path: str):
+        """Forget only paths referring to the model successfully moved to Trash."""
+        deleted = Path(path).resolve(strict=False)
+        def matches(value):
+            return bool(value) and Path(value).resolve(strict=False) == deleted
+        if matches(self.model.text().strip()):
+            self.model.clear()
+        if matches(self._pending_model):
+            self._pending_model = ""
+        try:
+            save_settings(self.settings())
+        except OSError:
+            self.show_error("The model was moved to Trash, but settings could not be saved.")
+        self.refresh()
+
     def copy_key(self):
         if self.controller.owned and self.controller.api.key:
             QApplication.clipboard().setText(self.controller.api.key)
             self.connection_detail.setText("API key copied to the clipboard; valid only for this server session.")
 
     def start_server(self):
+        if self.hub_panel.deletion_in_progress:
+            return
         self.notice.hide()
         self.controller.start(self.settings())
 
@@ -712,6 +735,9 @@ class MainWindow(QMainWindow):
             self.binary.setText(filename)
 
     def show_error(self, message):
+        if "only llama is implemented" in message:
+            message += (" Choose a compatible LLaMA-architecture GGUF in Models. "
+                        "Changing GPU or Docker settings cannot add support for this architecture.")
         self.notice.setText(message)
         self.notice.show()
         self._sync_strip()
@@ -821,7 +847,8 @@ class MainWindow(QMainWindow):
         self.metric_hints[2].setText(f"{runtime.get('queued_requests', 0)} requests queued")
         self.metric_values[3].setText(bytes_label(c.metrics.get("engine", {}).get("host_weight_payload_bytes")))
         self.metric_view.setPlainText(json.dumps(c.metrics, ensure_ascii=False, indent=2)[:65536] if c.metrics else "Waiting for metrics…")
-        self.start_button.setEnabled(c.mode != "external" and not c.owned and not c.probing and not c.stopping)
+        deleting = self.hub_panel.deletion_in_progress
+        self.start_button.setEnabled(not deleting and c.mode != "external" and not c.owned and not c.probing and not c.stopping)
         self.start_button.setToolTip(
             "Connected to an external server. Manage its process with its original launcher. "
             "Disconnect before starting a separate local server."
@@ -829,17 +856,19 @@ class MainWindow(QMainWindow):
             "Start a local nexus-server executable. To use a running Docker server, connect to its API address."
         )
         self.stop_button.setEnabled(c.owned and not c.stopping)
-        self.restart_button.setEnabled(c.owned and not c.stopping and not c.starting)
+        self.restart_button.setEnabled(not deleting and c.owned and not c.stopping and not c.starting)
         self.connect_button.setEnabled(not c.owned and not c.probing)
         self.disconnect_button.setEnabled(c.mode == "external")
         available = bool(c.health) and c.authorized and not c.busy and not c.starting and not c.stopping
         self.copy_key_button.setVisible(c.owned)
         self.copy_key_button.setEnabled(c.owned and bool(c.api.key) and not c.stopping)
-        self.load_button.setEnabled(available)
-        self.reload_button.setEnabled(available and bool(c.model_info.get("path")))
-        self.unload_button.setEnabled(available and loaded)
+        self.load_button.setEnabled(available and not deleting)
+        self.reload_button.setEnabled(available and not deleting and bool(c.model_info.get("path")))
+        self.unload_button.setEnabled(available and not deleting and loaded)
         generating = bool(getattr(self.chat_panel, "is_generating", False))
-        if c.busy:
+        if deleting:
+            hint = "Finish deleting the selected model before changing server models."
+        elif c.busy:
             hint = "Operation in progress; check the logs for details."
         elif not available:
             hint = "Model actions become available when the server is ready."

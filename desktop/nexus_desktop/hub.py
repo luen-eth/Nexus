@@ -25,11 +25,11 @@ from urllib.parse import quote, urlencode, urlsplit, urljoin
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 import uuid
 
-from PySide6.QtCore import Qt, QObject, Signal, QSize, QBuffer, QByteArray, QIODevice, QThread
+from PySide6.QtCore import Qt, QObject, Signal, QSize, QBuffer, QByteArray, QIODevice, QThread, QFile
 from PySide6.QtGui import QIcon, QImageReader, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QProgressBar, QPushButton, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QVBoxLayout, QWidget, QMessageBox,
 )
 
 
@@ -181,6 +181,60 @@ def inspect_gguf(path: Path) -> dict:
         return _inspect_stream(stream)
 
 
+def _require_supported_architecture(architecture):
+    if isinstance(architecture, str) and architecture and architecture != "llama":
+        raise HubError(f"Nexus does not support the '{architecture[:128]}' architecture. Choose a compatible LLaMA GGUF model.")
+
+
+def _delete_file_identity(root: Path, path: Path) -> tuple[int, int, int, int, int]:
+    """Validate a library member without following any directory or file links."""
+    root, path = Path(root).absolute(), Path(path).absolute()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise HubError("Only models inside this local library can be moved to Trash.") from error
+    if (not relative.parts or ".." in path.parts or ".." in root.parts
+            or path.suffix.lower() != ".gguf"):
+        raise HubError("Select a regular GGUF file inside the local library.")
+    directory = None
+    try:
+        directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        for component in path.parent.parts[1:]:
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(descriptor, "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise HubError("Only regular GGUF files can be moved to Trash.")
+            header = source.read(8)
+            if len(header) != 8 or header[:4] != b"GGUF" or struct.unpack("<I", header[4:])[0] not in {2, 3}:
+                raise HubError("The selected file is not a GGUF v2/v3 model.")
+            return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+    except OSError as error:
+        raise HubError("The model is unavailable or its path contains a symlink. Refresh the library.") from error
+    finally:
+        if directory is not None:
+            os.close(directory)
+
+
+def _move_to_trash(path: Path) -> bool:
+    # The instance overload returns bool across supported PySide6 versions.
+    # Never fall back to permanent removal when the platform cannot use Trash.
+    return QFile(str(path)).moveToTrash()
+
+
+def _trash_model(path: Path, root: Path, expected, cancel: threading.Event) -> str:
+    _check_cancel(cancel)
+    if _delete_file_identity(root, path) != expected:
+        raise HubError("The selected file changed after confirmation. Review it and try again.")
+    _check_cancel(cancel)
+    if not _move_to_trash(path):
+        raise HubError("The model could not be moved to Trash. No permanent deletion was attempted.")
+    return str(path)
+
+
 def _directory_fd(path: Path) -> int:
     """Create/open each component without following symlinks (Linux)."""
     absolute = path.absolute()
@@ -314,6 +368,7 @@ class HubClient:
     def download(self, file: HubFile, root: Path, cancel: threading.Event,
                  progress: Callable[[int, int], None]) -> Path:
         _check_cancel(cancel)
+        _require_supported_architecture(file.architecture)
         repo_parts, file_parts = _parts(file.repo, repo=True), _parts(file.name)
         if not re.fullmatch(r"[a-fA-F0-9]{40}", file.revision):
             raise HubError("An immutable repository revision is required.")
@@ -375,7 +430,8 @@ class HubClient:
                 raise HubError("SHA-256 verification failed. No model file was installed.")
             check_fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
             with os.fdopen(check_fd, "rb") as stream:
-                _inspect_stream(stream)
+                metadata = _inspect_stream(stream)
+                _require_supported_architecture(metadata.get("general.architecture"))
             _check_cancel(cancel)
             # A hard-link publication is atomic and fails if ANY destination exists.
             os.link(temporary, relative[-1], src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
@@ -720,6 +776,8 @@ class _WorkerSignals(QObject):
 
 class ModelHubPanel(QWidget):
     model_selected = Signal(str)
+    model_deleted = Signal(str)
+    deletion_state_changed = Signal()
 
     def __init__(self, controller, download_dir: str = "", parent=None):
         super().__init__(parent)
@@ -739,7 +797,11 @@ class ModelHubPanel(QWidget):
         self._closed = False
         self._download_file = None
         self._local_rescan = False
+        self._delete_confirming = False
+        self._delete_path = None
         self._build_ui()
+        if self.controller is not None:
+            self.controller.changed.connect(self._controller_changed)
         self.refresh_local()
 
     @staticmethod
@@ -819,16 +881,144 @@ class ModelHubPanel(QWidget):
         self.local_files.setMinimumHeight(110)
         self.local_files.setObjectName("hubLocalFiles")
         self.local_files.setIconSize(QSize(32, 32))
-        self.local_files.currentItemChanged.connect(lambda *_: self.load_button.setEnabled(self.local_files.currentItem() is not None))
+        self.local_files.currentItemChanged.connect(self._update_local_actions)
         layout.addWidget(self.local_files)
         self.load_button = QPushButton("Load selected model")
         self.load_button.setProperty("primary", True)
         self.load_button.setEnabled(False)
         self.load_button.clicked.connect(self._load_selected)
-        layout.addWidget(self.load_button)
+        self.delete_button = QPushButton("Delete selected model")
+        self.delete_button.setObjectName("hubDelete")
+        self.delete_button.setProperty("danger", True)
+        self.delete_button.setEnabled(False)
+        self.delete_button.clicked.connect(self._delete_selected)
+        local_actions = QHBoxLayout()
+        local_actions.addWidget(self.load_button, 1)
+        local_actions.addWidget(self.delete_button, 1)
+        layout.addLayout(local_actions)
+        layout.addWidget(self._label("Deleted models move to the system Trash. Disk space is freed only when you empty Trash.", "subtitle"))
         self.directory_label = self._label(str(self.download_dir), "subtitle")
         self.directory_label.setToolTip("Model library directory. For Docker, mount this same absolute path in the server container.")
         layout.addWidget(self.directory_label)
+
+    @property
+    def deletion_in_progress(self):
+        return self._delete_confirming or "delete" in self._jobs
+
+    def _selected_local_path(self):
+        item = self.local_files.currentItem()
+        value = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return Path(value) if isinstance(value, str) and value else None
+
+    def _delete_block_reason(self, path, *, own_operation=False):
+        if self._closed:
+            return "The model library is closing."
+        if path is None:
+            return "Select a local model first."
+        if not own_operation and self.deletion_in_progress:
+            return "Wait for the current deletion to finish."
+        if "download" in self._jobs or "loadcheck" in self._jobs:
+            return "Wait for the current download or model load check to finish."
+        c = self.controller
+        if c is None:
+            return ""
+        if any(getattr(c, name, False) for name in ("busy", "starting", "stopping", "probing")):
+            return "Wait for the current server operation to finish."
+        health, info = c.health, c.model_info
+        loaded = health.get("model_loaded") is True or info.get("loaded") is True
+        if c.mode != "disconnected" and type(health.get("model_loaded")) is not bool:
+            return "Wait for the server's model status before deleting a file."
+        if loaded:
+            loaded_path = info.get("path")
+            if not isinstance(loaded_path, str) or not loaded_path or not Path(loaded_path).is_absolute():
+                return "The loaded model's file path is unknown. Unload it before deleting a file."
+            if os.path.abspath(path) == os.path.abspath(loaded_path):
+                return "This model is loaded. Unload it in Server settings before deleting it."
+            try:
+                if os.path.samefile(path, loaded_path):
+                    return "This model is loaded. Unload it in Server settings before deleting it."
+            except OSError:
+                pass
+        return ""
+
+    def _update_local_actions(self, *_):
+        path = self._selected_local_path()
+        self.load_button.setEnabled(not self._closed and path is not None
+                                    and not self.deletion_in_progress and "loadcheck" not in self._jobs)
+        reason = self._delete_block_reason(path)
+        self.delete_button.setEnabled(not reason)
+        self.delete_button.setToolTip(reason or "Move this model to the system Trash after confirmation.")
+
+    def _controller_changed(self):
+        if self._closed:
+            return
+        job = self._jobs.get("delete")
+        if job and self._delete_block_reason(self._delete_path, own_operation=True):
+            job[1].set()
+        self._update_local_actions()
+
+    def _confirm_delete(self, path: Path, size: int) -> bool:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Move model to Trash?")
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText(f"Delete {path.name} from your local model library?")
+        dialog.setInformativeText(f"File: {path}\nSize: {_size(size)}\n\nThe file will move to the system Trash. You can restore it there. Disk space is freed only when you empty Trash.")
+        dialog.setStandardButtons(QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Discard)
+        dialog.button(QMessageBox.StandardButton.Discard).setText("Move to Trash")
+        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        dialog.setEscapeButton(QMessageBox.StandardButton.Cancel)
+        try:
+            return dialog.exec() == QMessageBox.StandardButton.Discard
+        finally:
+            dialog.deleteLater()
+
+    def _delete_selected(self):
+        path = self._selected_local_path()
+        reason = self._delete_block_reason(path)
+        if reason:
+            self.status.setText(reason)
+            return
+        try:
+            expected = _delete_file_identity(self.download_dir, path)
+        except HubError as error:
+            self.status.setText(str(error))
+            return
+        self._delete_confirming = True
+        self._update_local_actions()
+        self._file_selected(self.file_list.currentItem())
+        self.deletion_state_changed.emit()
+        try:
+            if not self._confirm_delete(path, expected[2]):
+                if not self._closed:
+                    self.status.setText("Deletion cancelled. The model was not changed.")
+                return
+            if self._closed:
+                return
+            reason = self._delete_block_reason(path, own_operation=True)
+            if reason:
+                self.status.setText(reason)
+                return
+            if self._selected_local_path() != path:
+                self.status.setText("The selected model changed. Review the selection and try again.")
+                return
+            if _delete_file_identity(self.download_dir, path) != expected:
+                self.status.setText("The selected file changed after confirmation. Review it and try again.")
+                return
+            self._delete_path = path
+            if self._submit("delete", lambda cancel, _: _trash_model(path, self.download_dir, expected, cancel)):
+                self.status.setText(f"Moving {path.name} to Trash…")
+            else:
+                self._delete_path = None
+                self.status.setText("Another library operation is still running. Try again when it finishes.")
+        except HubError as error:
+            self.status.setText(str(error))
+        finally:
+            self._delete_confirming = False
+            if not self._closed:
+                self._update_local_actions()
+                self._file_selected(self.file_list.currentItem())
+                self.deletion_state_changed.emit()
 
     def _item_logo(self, item, author="", path=""):
         item.setData(LogoCache.AUTHOR_ROLE, author)
@@ -858,6 +1048,10 @@ class ModelHubPanel(QWidget):
         self._serial += 1
         serial, cancel, signals = self._serial, threading.Event(), self._signals
         self._jobs[kind] = (serial, cancel)
+        if kind in {"download", "loadcheck", "delete"}:
+            self._update_local_actions()
+        if kind == "delete":
+            self.deletion_state_changed.emit()
 
         def work():
             try:
@@ -900,11 +1094,12 @@ class ModelHubPanel(QWidget):
 
     def _file_selected(self, item, _previous=None):
         file = item.data(Qt.ItemDataRole.UserRole) if item else None
-        allowed = bool(file and not file.split and 24 <= file.size <= self.client.MAX_FILE_BYTES)
-        self.download_button.setEnabled(allowed and "download" not in self._jobs)
+        supported = bool(file and (not file.architecture or file.architecture == "llama"))
+        allowed = bool(file and supported and not file.split and 24 <= file.size <= self.client.MAX_FILE_BYTES)
+        self.download_button.setEnabled(allowed and "download" not in self._jobs and not self.deletion_in_progress)
         if not file:
             return
-        architecture = file.architecture or "unknown (not verified)"
+        architecture = file.architecture or "unknown; compatibility is not verified"
         if file.architecture and file.architecture != "llama":
             architecture += " (not currently supported by Nexus)"
         integrity = "SHA-256 available" if file.sha256 else "Publisher SHA-256 unavailable; size and GGUF structure will be checked"
@@ -913,9 +1108,14 @@ class ModelHubPanel(QWidget):
 
     def start_download(self):
         item = self.file_list.currentItem()
-        if not item or "download" in self._jobs:
+        if not item or "download" in self._jobs or self.deletion_in_progress:
             return
         file = item.data(Qt.ItemDataRole.UserRole)
+        try:
+            _require_supported_architecture(file.architecture)
+        except HubError as error:
+            self.status.setText(str(error))
+            return
         self._download_file = file
         last_update = [0.0]
         signals = self._signals
@@ -992,23 +1192,38 @@ class ModelHubPanel(QWidget):
                 self.refresh_local(select=self._select_local)
         elif kind == "loadcheck":
             self.model_selected.emit(str(result))
-        if kind == "loadcheck":
-            self.load_button.setEnabled(self.local_files.currentItem() is not None)
+        elif kind == "delete":
+            self.model_deleted.emit(str(result))
+            self.status.setText("Model moved to Trash. Disk space is freed only when you empty Trash.")
+            self.refresh_local()
+        if kind == "delete":
+            self._delete_path = None
+            self.deletion_state_changed.emit()
+            self._file_selected(self.file_list.currentItem())
         if kind == "download":
             self.cancel_button.setEnabled(False)
             if error:
                 self.progress.setFormat("Download not installed")
             self._file_selected(self.file_list.currentItem())
+        self._update_local_actions()
+        if self._local_rescan and "local" not in self._jobs and not self.deletion_in_progress:
+            self.refresh_local(select=self._select_local)
 
     def refresh_local(self, _checked=False, *, select=""):
         self._select_local = select
+        if self.deletion_in_progress:
+            self._local_rescan = True
+            return
         if "local" in self._jobs:
             self._local_rescan = True
             return
         self._local_rescan = False
-        self._submit("local", lambda cancel, _: list_local_models(self.download_dir))
+        if not self._submit("local", lambda cancel, _: list_local_models(self.download_dir)):
+            self._local_rescan = True
 
     def _load_selected(self):
+        if self._closed or self.deletion_in_progress or "loadcheck" in self._jobs:
+            return
         item = self.local_files.currentItem()
         if item:
             path = Path(item.data(Qt.ItemDataRole.UserRole))
@@ -1017,7 +1232,8 @@ class ModelHubPanel(QWidget):
                     _check_cancel(cancel)
                     if re.search(r"-\d{5}-of-\d{5}\.gguf$", path.name, re.IGNORECASE):
                         raise HubError("Split GGUF models are not supported. Choose a single-file model.")
-                    inspect_gguf(path)
+                    metadata = inspect_gguf(path)
+                    _require_supported_architecture(metadata.get("general.architecture"))
                     _check_cancel(cancel)
                     return path
                 if self._submit("loadcheck", checked):
@@ -1029,10 +1245,18 @@ class ModelHubPanel(QWidget):
         if self._closed:
             return
         self._closed = True
+        if self.controller is not None:
+            try:
+                self.controller.changed.disconnect(self._controller_changed)
+            except (RuntimeError, TypeError):
+                pass
         self.logo_cache.shutdown()
         for _, cancel in self._jobs.values():
             cancel.set()
         self._jobs.clear()
+        self._delete_confirming = False
+        self._delete_path = None
+        self.deletion_state_changed.emit()
         self._executor.shutdown(wait=False, cancel_futures=True)
 
     def closeEvent(self, event):

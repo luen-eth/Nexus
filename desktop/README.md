@@ -22,9 +22,13 @@ Downloads are pinned to the repository commit returned by Hugging Face. Before a
 
 Select a file under **Your local models** and choose **Load selected model**. With a connected server, this loads the file using the current Server settings. Without a connection, the application fills the model path and opens **Server** so you can start or connect explicitly. **Refresh** rescans the library; it does not download anything.
 
+**Delete selected model** shows the file name, full path and size before asking to move it to the system Trash. Cancel is the default. Unload a model before deleting its file; deletion is also unavailable during model operations. Only regular GGUF files inside the library are eligible. Successful deletion refreshes the library and clears a matching saved model path. If Trash is unavailable, the file is left in place. Space is reclaimed when you empty Trash using your file manager.
+
 The library directory is the saved `models_dir` setting, otherwise `NEXUS_MODELS_DIR`, otherwise `$XDG_DATA_HOME/nexus/models` (default: `~/.local/share/nexus/models`). Downloaded files are organized as `owner/repository/commit/path/to/model.gguf`. The selected directory is saved in the XDG settings file. For Docker, use a library directory mounted at the **same absolute path** inside the container, with permissions readable by the server's configured UID/GID. A read-only container mount can still see files downloaded by the desktop application on the host. See the [Docker guide](../docs/docker.md) for server setup.
 
 A GGUF search result or successful download does not guarantee that Nexus can run the model. Current support requires a compatible LLaMA architecture, full-head unscaled RoPE, tokenizer, and tensor formats; the server performs final validation when loading. Split GGUF models are rejected. Runtime weights expand to F32, so compressed download size is not a RAM or VRAM requirement. Check the [validation notes](../docs/validation.md) before choosing larger models.
+
+Known unsupported architectures reported by Hugging Face, such as `gemma4`, cannot be downloaded through the model browser. Missing architecture metadata is shown as unknown, not compatible. Local files are inspected before a Models-page load request; an unsupported architecture is rejected with guidance. These checks do not add inference support for that architecture or guarantee all LLaMA variants will run.
 
 ## Development
 

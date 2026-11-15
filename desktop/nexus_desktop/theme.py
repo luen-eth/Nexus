@@ -68,6 +68,8 @@ _TEMPLATE = """
 /* ---------- Base ---------- */
 QWidget {font-family:@font; font-size:13px; color:@ink;}
 QMainWindow, #content, #pageSurface, #page {background:@canvas;}
+QMessageBox {background:@surface; color:@ink;}
+QMessageBox QLabel {background:transparent; color:@ink;}
 QToolTip {background:@ink; color:#ffffff; border:1px solid @ink; padding:6px 9px;}
 QScrollArea {border:0; background:transparent;}
 

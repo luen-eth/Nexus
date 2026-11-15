@@ -5,10 +5,11 @@ import socket
 import tempfile
 import time
 import unittest
+from unittest.mock import PropertyMock, patch
 from PySide6.QtCore import QProcess, QTimer, QEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
-from nexus_desktop.config import Settings
+from nexus_desktop.config import Settings, load_settings
 from nexus_desktop.controller import ServerController
 from nexus_desktop.window import MainWindow
 
@@ -69,6 +70,41 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(until(lambda: bool(self.controller.health)), self.controller.detail)
         self.assertTrue(self.controller.owned)
         return self.controller
+
+    def test_model_deletion_clears_only_matching_saved_selection(self):
+        root = Path(self.directory.name)
+        deleted, other = root / "deleted.gguf", root / "other.gguf"
+        window = MainWindow(Settings(model=str(deleted), models_dir=str(root)), self.controller)
+        self.windows.append(window)
+        window._pending_model = str(deleted)
+        window.hub_panel.model_deleted.emit(str(deleted))
+        self.assertEqual(window.model.text(), "")
+        self.assertEqual(window._pending_model, "")
+        self.assertEqual(load_settings().model, "")
+        window.model.setText(str(other))
+        window._pending_model = str(other)
+        window.hub_panel.model_deleted.emit(str(deleted))
+        self.assertEqual(window.model.text(), str(other))
+        self.assertEqual(window._pending_model, str(other))
+        self.assertEqual(load_settings().model, str(other))
+
+    def test_deletion_locks_server_model_actions_and_start(self):
+        window = MainWindow(Settings(models_dir=self.directory.name), self.controller)
+        self.windows.append(window)
+        self.controller.health = {"status": "ok", "model_loaded": True}
+        self.controller.model_info = {"path": "/tmp/loaded.gguf"}
+        with patch.object(type(window.hub_panel), "deletion_in_progress", new_callable=PropertyMock, return_value=True), \
+                patch.object(self.controller, "start") as start, \
+                patch.object(self.controller, "model_action") as action:
+            window.hub_panel.deletion_state_changed.emit()
+            for button in (window.start_button, window.load_button, window.reload_button, window.unload_button):
+                self.assertFalse(button.isEnabled())
+            window.start_server()
+            window.run_model_action("load")
+            window.load_model_from_hub("/tmp/other.gguf")
+            start.assert_not_called()
+            action.assert_not_called()
+            self.assertEqual(window.model.text(), "")
 
     def test_owned_lifecycle_keeps_key_out_of_arguments_logs_and_settings(self):
         controller = self.start()
