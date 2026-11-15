@@ -150,9 +150,9 @@ class ControllerTests(unittest.TestCase):
         self.settings.binary = "/does/not/exist/nexus-server"
         self.controller.start(self.settings)
         self.assertFalse(self.controller.owned)
-        self.assertIn("bulunamadı", self.controller.detail)
+        self.assertIn("was not found", self.controller.detail)
         self.controller.connect_external(f"http://127.0.0.1:{free_port()}")
-        self.assertTrue(until(lambda: self.controller.state == "Bağlantı yok"))
+        self.assertTrue(until(lambda: self.controller.state == "No connection"))
 
     def test_stale_network_callbacks_are_cancelled_on_disconnect(self):
         owner = self.start()
@@ -169,9 +169,9 @@ class ControllerTests(unittest.TestCase):
     def test_failed_child_and_cancelled_start_probe_do_not_leave_a_process(self):
         self.settings.binary = "/usr/bin/false"
         self.controller.start(self.settings)
-        self.assertTrue(until(lambda: self.controller.state == "Sunucu hatası"))
+        self.assertTrue(until(lambda: self.controller.state == "Server error"))
         self.assertFalse(self.controller.owned)
-        self.assertIn("çıkış kodu", self.controller.detail)
+        self.assertIn("exit code", self.controller.detail)
         self.settings.binary = FAKE
         window = MainWindow(self.settings, self.controller)
         self.windows.append(window)

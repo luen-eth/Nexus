@@ -109,19 +109,19 @@ class ApiClient(QObject):
                 return
             data = {}
             if state["expired"]:
-                error = "Sunucu isteği süre sınırını aştı."
+                error = "The server request timed out."
             elif state["too_large"]:
-                error = "Sunucu yanıtı boyut sınırını aştı."
+                error = "The server response exceeded the size limit."
             elif body:
                 try:
                     data = json.loads(body)
                 except (ValueError, UnicodeDecodeError):
-                    error = "Sunucu geçerli JSON döndürmedi."
+                    error = "The server did not return valid JSON."
             elif 200 <= code < 300:
-                error = "Sunucu boş bir JSON yanıtı döndürdü."
+                error = "The server returned an empty JSON response."
             if 200 <= code < 300 and (error or not isinstance(data, dict)):
                 code = 0
-                error = error or "Sunucu geçerli bir JSON nesnesi döndürmedi."
+                error = error or "The server did not return a valid JSON object."
             callback(code, data, error, network_error)
 
         reply.metaDataChanged.connect(metadata_received)

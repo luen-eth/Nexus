@@ -1,0 +1,15 @@
+# Allow only build inputs. Models, credentials, reviews and unrelated artifacts
+# never enter the build context; the prebuilt target needs just this one binary.
+**
+!Dockerfile
+!.dockerignore
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!tools/
+!tools/nexus-convert/
+!tools/nexus-convert/**
+!target/
+!target/release/
+!target/release/nexus-server

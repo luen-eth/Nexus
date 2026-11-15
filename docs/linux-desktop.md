@@ -1,6 +1,6 @@
 # Linux desktop and packages
 
-Nexus Desktop is a native Qt server manager. It selects a GGUF model and CPU/CUDA backend, starts or stops the local server, manages model loading, and shows status, metrics and bounded logs. It can also connect to an existing loopback server. It does not provide a chat screen or download model weights.
+Nexus Desktop is a native Qt server manager with an English interface. It selects a GGUF model and CPU/CUDA backend, starts or stops the local server, manages model loading, and shows status, metrics and bounded logs. It can also connect to an existing loopback server. It does not provide a chat screen or download model weights.
 
 ## Packages and supported systems
 

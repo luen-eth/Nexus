@@ -1,5 +1,6 @@
 """CLI parsing is Qt-free so --help/--version also work without a display."""
 import argparse
+import os
 from . import __version__
 
 
@@ -17,16 +18,16 @@ def install_signal_handlers(application, window):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="nexus-desktop", description="Nexus yerel sunucu yöneticisi · Linux / Qt 6")
+    parser = argparse.ArgumentParser(prog="nexus-desktop", description="Nexus local server manager · Linux / Qt 6")
     parser.add_argument("--version", action="version", version=f"Nexus Desktop {__version__}")
-    parser.add_argument("--server", help="nexus-server çalıştırılabilir dosyası")
-    parser.add_argument("--model", help="GGUF model dosyası")
-    parser.add_argument("--port", type=int, help="Yerel sunucu portu")
-    parser.add_argument("--connect", metavar="URL", help="Var olan localhost sunucuya bağlan; yeni süreç başlatma")
+    parser.add_argument("--server", help="Path to the nexus-server executable")
+    parser.add_argument("--model", help="Path to a GGUF model file")
+    parser.add_argument("--port", type=int, help="Local server port")
+    parser.add_argument("--connect", metavar="URL", help="Connect to an existing localhost server; uses NEXUS_API_KEY for authentication")
     args = parser.parse_args(argv)
     if args.port is not None and not 1 <= args.port <= 65535:
-        parser.error("port 1..65535 aralığında olmalı")
-    from PySide6.QtCore import QTimer, QEvent
+        parser.error("port must be between 1 and 65535")
+    from PySide6.QtCore import QTimer, QEvent, QLocale
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
     from .config import load_settings
@@ -39,6 +40,12 @@ def main(argv=None):
         settings.model = args.model
     if args.port is not None:
         settings.port = args.port
+    connect_key = ""
+    if args.connect:
+        settings.server_url = args.connect
+        # Keep authentication out of argv/settings and do not pass it to children.
+        connect_key = os.environ.pop("NEXUS_API_KEY", "")
+    QLocale.setDefault(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
     application = QApplication(["nexus-desktop"])
     application.setApplicationName("Nexus Desktop")
     application.setOrganizationName("Nexus")
@@ -48,7 +55,8 @@ def main(argv=None):
     window.show()
     signal_timer = install_signal_handlers(application, window)
     if args.connect:
-        QTimer.singleShot(0, lambda: window.controller.connect_external(args.connect))
+        window.key.setText(connect_key)
+        QTimer.singleShot(0, window.connect_server)
     result = application.exec()
     signal_timer.stop()
     window.deleteLater()

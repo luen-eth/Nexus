@@ -94,13 +94,13 @@ class ApiTests(unittest.TestCase):
             code, data, error, _network = self.request(path)
             self.assertEqual(code, 0, path)
             self.assertEqual(data, {})
-            self.assertIn("boyut sınırı", error)
+            self.assertIn("size limit", error)
 
     def test_absolute_deadline_limits_a_continuous_slow_drip(self):
         start = time.monotonic()
         code, _data, error, _network = self.request("/drip", timeout=180)
         self.assertEqual(code, 0)
-        self.assertIn("süre sınırı", error)
+        self.assertIn("timed out", error)
         self.assertLess(time.monotonic()-start, 1.5)
 
     def test_cancellation_stops_timers_and_drops_stale_callbacks(self):

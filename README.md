@@ -88,7 +88,9 @@ Nexus Desktop is a native Qt server manager for Linux. Choose a model and CPU/CU
 
 ![Nexus Desktop in its initial disconnected state, showing model settings, server controls and logs](docs/assets/nexus-desktop.png)
 
-The interface is in Turkish. The screenshot shows the actual application's initial state; no model is running. Arch Linux packages and a GUI-only Debian package are described in [Linux desktop installation](docs/linux-desktop.md). The desktop app manages the server; it is not a chat client or a model downloader.
+The interface is in English. The screenshot shows the actual application's initial state; no model is running. Arch Linux packages and a GUI-only Debian package are described in [Linux desktop installation](docs/linux-desktop.md). The desktop app manages the server; it is not a chat client or a model downloader.
+
+To run the server in a Linux container with NVIDIA GPU access and connect the host desktop app, see [Docker setup](docs/docker.md).
 
 ## Architecture
 

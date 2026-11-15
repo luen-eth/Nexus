@@ -80,11 +80,11 @@ def local_url(value: str) -> str:
         parts = urlsplit(value.strip())
         port = parts.port if parts.port is not None else 8080
     except ValueError as error:
-        raise ValueError("Geçerli bir yerel adres ve port girin.") from error
+        raise ValueError("Enter a valid local address and port.") from error
     if (parts.scheme != "http" or parts.hostname not in {"localhost", "127.0.0.1", "::1"}
             or parts.username or parts.password or parts.query or parts.fragment or parts.path not in {"", "/"}
             or not 1 <= port <= 65535):
-        raise ValueError("Yalnız yerel HTTP adresleri desteklenir: http://127.0.0.1:8080")
+        raise ValueError("Only local HTTP addresses are supported: http://127.0.0.1:8080")
     host = "[::1]" if parts.hostname == "::1" else parts.hostname
     return f"http://{host}:{port}"
 

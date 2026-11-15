@@ -1,0 +1,53 @@
+name: nexus
+services:
+  nexus:
+    image: ${NEXUS_IMAGE:-nexus-server:0.1.0-cuda}
+    pull_policy: never
+    user: "${NEXUS_UID:-1000}:${NEXUS_GID:-1000}"
+    devices:
+      - nvidia.com/gpu=all
+    environment:
+      NEXUS_API_KEY: ${NEXUS_API_KEY:?Set NEXUS_API_KEY for the server and desktop client}
+    ports:
+      - "127.0.0.1:${NEXUS_PORT:-8080}:8080"
+    volumes:
+      - type: bind
+        source: ${NEXUS_MODELS_DIR:?Set an absolute NEXUS_MODELS_DIR}
+        target: ${NEXUS_MODELS_DIR:?Set an absolute NEXUS_MODELS_DIR}
+        read_only: true
+        bind:
+          create_host_path: false
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --backend
+      - cuda
+      - --model
+      - ${NEXUS_MODELS_DIR:?}/${NEXUS_MODEL_FILE:-model.gguf}
+      - --ctx-size
+      - ${NEXUS_CTX_SIZE:-4096}
+      - --kv-quant
+      - ${NEXUS_KV_QUANT:-none}
+      - --batch-size
+      - ${NEXUS_BATCH_SIZE:-4}
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --max-time 5 http://127.0.0.1:8080/health | grep -Eq '\"status\"[[:space:]]*:[[:space:]]*\"ok\"'"]
+      interval: 15s
+      timeout: 6s
+      start_period: 120s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

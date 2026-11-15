@@ -28,8 +28,8 @@ class ServerController(QObject):
         self.api = ApiClient(self)
         self.process: QProcess | None = None
         self.mode = "disconnected"
-        self.state = "Bağlı değil"
-        self.detail = "Bir sunucu başlatın veya yerel sunucuya bağlanın."
+        self.state = "Disconnected"
+        self.detail = "Start a server or connect to a local server."
         self.health: dict = {}
         self.models: list = []
         self.metrics: dict = {}
@@ -62,8 +62,8 @@ class ServerController(QObject):
     def _redact(self, text: str) -> str:
         for key in self._secret_history:
             if key:
-                text = text.replace(key, "[gizlendi]")
-        return re.sub(r"(?i)(Bearer\s+|NEXUS_API_KEY\s*[=:]\s*)[^\s\",;]+", r"\1[gizlendi]", text)
+                text = text.replace(key, "[redacted]")
+        return re.sub(r"(?i)(Bearer\s+|NEXUS_API_KEY\s*[=:]\s*)[^\s\",;]+", r"\1[redacted]", text)
 
     def log(self, text: str):
         for line in self._redact(text).splitlines():
@@ -85,31 +85,31 @@ class ServerController(QObject):
         binary = settings.binary.strip() or discover_binary()
         resolved = shutil.which(binary) if binary and not Path(binary).is_absolute() else binary
         if not resolved or not Path(resolved).is_file() or not os.access(resolved, os.X_OK):
-            self._fail("nexus-server bulunamadı. Sunucu paketini kurun veya çalıştırılabilir dosyayı seçin.")
+            self._fail("nexus-server was not found. Install the server package or select its executable.")
             return
         if settings.model and not Path(settings.model).is_file():
-            self._fail("Seçilen model dosyası bulunamadı. Geçerli bir GGUF dosyası seçin.")
+            self._fail("The selected model file was not found. Select a valid GGUF file.")
             return
         if settings.backend not in {"cpu", "cuda"} or settings.kv_quant not in {"none", "tq_3b2b", "tq_3b4b", "tq_4b4b", "block_q4", "block_q6"}:
-            self._fail("Desteklenmeyen backend veya KV biçimi.")
+            self._fail("Unsupported backend or KV format.")
             return
         if not 1 <= settings.port <= 65535 or settings.context < 1 or not 1 <= settings.batch_size <= 16:
-            self._fail("Port, context ve eşzamanlı istek değerlerini kontrol edin.")
+            self._fail("Check the port, context size and concurrent request limit.")
             return
         self.disconnect()
         self._settings = replace(settings, binary=str(Path(resolved).resolve()))
         base = f"http://127.0.0.1:{settings.port}"
         self.api.configure(base)
         self.probing = True
-        self.state, self.detail = "Port kontrol ediliyor", base
+        self.state, self.detail = "Checking port", base
         self.changed.emit()
 
         def checked(status, _data, error, network_error):
             self.probing = False
             # Refuse to take over an existing endpoint, even if it returns 401/404.
             if status or network_error != QNetworkReply.NetworkError.ConnectionRefusedError:
-                self.state = "Başlatılamadı"
-                self._fail("Bu port kullanılıyor veya yanıt vermiyor. Var olan sunucuya bağlanın ya da başka port seçin.")
+                self.state = "Failed to start"
+                self._fail("This port is in use or is not responding. Connect to the existing server or choose another port.")
                 return
             self._spawn(self._settings)
         self.api.request("probe", "/health", checked, authenticate=False, timeout=1800)
@@ -133,8 +133,8 @@ class ServerController(QObject):
         process.setProgram(settings.binary)
         process.setArguments(args)
         self.process = process
-        self.mode, self.state = "owned", "Başlatılıyor"
-        self.detail = "Sunucu hazırlanıyor. Model yüklenirken günlükleri izleyebilirsiniz."
+        self.mode, self.state = "owned", "Starting"
+        self.detail = "Preparing the server. You can follow the logs while the model loads."
         self.starting, self.stopping = True, False
         self.authorized = True
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -143,7 +143,7 @@ class ServerController(QObject):
         process.started.connect(self.poll)
         process.finished.connect(lambda code, _status: self._finished(process, code))
         process.errorOccurred.connect(lambda error: self._process_error(process, error))
-        self.log(f"Yerel sunucu başlatılıyor · {settings.backend.upper()} · port {settings.port}")
+        self.log(f"Starting local server · {settings.backend.upper()} · port {settings.port}")
         process.start()
         self.timer.start()
         self.changed.emit()
@@ -169,7 +169,7 @@ class ServerController(QObject):
         if process is not self.process:
             return
         if error == QProcess.ProcessError.FailedToStart:
-            self._fail("Sunucu çalıştırılamadı: " + process.errorString())
+            self._fail("Could not start the server: " + process.errorString())
             self._finished(process, -1)
 
     def _finished(self, process, code):
@@ -190,10 +190,10 @@ class ServerController(QObject):
         self.starting = self.stopping = False
         self.busy = False
         self.mode = "disconnected"
-        self.state = "Kapalı" if expected_stop or code == 0 else "Sunucu hatası"
-        self.detail = f"Sunucu kapandı (çıkış kodu {code})."
+        self.state = "Stopped" if expected_stop or code == 0 else "Server error"
+        self.detail = f"Server stopped (exit code {code})."
         if not expected_stop and code != 0:
-            self.detail += " Ayrıntılar için sunucu günlüğünü inceleyin."
+            self.detail += " Check the server log for details."
             self.error.emit(self.detail)
         self.health, self.models, self.metrics, self.model_info = {}, [], {}, {}
         self.log(self.detail)
@@ -207,14 +207,14 @@ class ServerController(QObject):
         if self.probing:
             self.api.cancel()
             self.probing = False
-            self.state = "Bağlı değil"
+            self.state = "Disconnected"
             self.changed.emit()
         process = self.process
         if not self.owned or self.stopping:
             return
         self.stopping = True
         self.starting = False
-        self.state, self.detail = "Durduruluyor", "Bu uygulamanın başlattığı sunucu kapatılıyor."
+        self.state, self.detail = "Stopping", "Stopping the server started by this application."
         self.timer.stop()
         self.api.cancel()
         self._kill_target = process
@@ -224,7 +224,7 @@ class ServerController(QObject):
 
     def _force_stop(self):
         if self._kill_target is self.process and self.owned:
-            self.log("Sunucu kapanışı gecikti; uygulamaya ait işlem sonlandırılıyor.")
+            self.log("Server shutdown timed out; terminating the process owned by this application.")
             self.process.kill()
 
     def restart(self, settings: Settings):
@@ -235,7 +235,7 @@ class ServerController(QObject):
 
     def connect_external(self, base: str, key=""):
         if self.owned or self.probing:
-            self._fail("Önce bu uygulamanın sunucusunu durdurun.")
+            self._fail("Stop the server started by this application first.")
             return
         try:
             base = local_url(base)
@@ -246,8 +246,8 @@ class ServerController(QObject):
         self.api.configure(base, key)
         if key:
             self._secret_history.append(key)
-        self.mode, self.state = "external", "Bağlanıyor"
-        self.detail = "Var olan yerel sunucu kontrol ediliyor."
+        self.mode, self.state = "external", "Connecting"
+        self.detail = "Checking the existing local server."
         self.authorized = True
         self.timer.start()
         self.changed.emit()
@@ -260,8 +260,8 @@ class ServerController(QObject):
         self.api.key = ""
         self.timer.stop()
         self.health, self.models, self.metrics, self.model_info = {}, [], {}, {}
-        self.mode, self.state = "disconnected", "Bağlı değil"
-        self.detail = "Bir sunucu başlatın veya yerel sunucuya bağlanın."
+        self.mode, self.state = "disconnected", "Disconnected"
+        self.detail = "Start a server or connect to a local server."
         self.busy = False
         self.changed.emit()
 
@@ -278,25 +278,25 @@ class ServerController(QObject):
             self.health = data
             if not isinstance(self.health.get("model"), str):
                 self.health["model"] = ""
-            self.state = "Hazır" if data.get("model_loaded") else "Model bekleniyor"
+            self.state = "Ready" if data.get("model_loaded") else "Waiting for model"
             if data.get("status") == "error":
-                self.state = "Sunucu hatası"
+                self.state = "Server error"
             if not self.busy:
-                self.detail = self.api.base + (" · Uygulama tarafından yönetiliyor" if self.mode == "owned" else " · Haricî sunucu; yalnız bağlantı yönetilir")
+                self.detail = self.api.base + (" · Managed by this application" if self.mode == "owned" else " · External server; connection only")
             if not self.authorized:
-                self.state = "API anahtarı gerekli"
-                self.detail = "Sunucuya erişiliyor, korunan API için geçerli anahtar girin."
+                self.state = "API key required"
+                self.detail = "The server is reachable. Enter a valid key to access the protected API."
         elif not self.starting:
             self.health = {}
-            self.state = "Bağlantı yok"
-            self.detail = "Yerel sunucuya ulaşılamıyor. Adres ve portu kontrol edin."
+            self.state = "No connection"
+            self.detail = "Cannot reach the local server. Check the address and port."
         self.changed.emit()
 
     def _data(self, tag, status, data, error):
         if status in {401, 403}:
             self.authorized = False
-            self.state = "API anahtarı gerekli"
-            self.detail = "Sunucuya erişiliyor, korunan API için geçerli anahtar girin."
+            self.state = "API key required"
+            self.detail = "The server is reachable. Enter a valid key to access the protected API."
         elif status == 200 and isinstance(data, dict):
             if tag == "models":
                 models = data.get("data", [])
@@ -318,21 +318,21 @@ class ServerController(QObject):
         payload = {}
         if action == "load":
             if not settings.model or not Path(settings.model).is_file():
-                self._fail("Önce geçerli bir GGUF model dosyası seçin.")
+                self._fail("Select a valid GGUF model file first.")
                 return
             payload = {"model": settings.model, "ctx_size": settings.context, "kv_quant": settings.kv_quant, "backend": settings.backend, "weight_quant": "f32"}
         self.busy = True
-        self.detail = {"load":"Model yükleniyor…", "reload":"Model yeniden yükleniyor…", "unload":"Model kaldırılıyor…"}[action]
+        self.detail = {"load":"Loading model…", "reload":"Reloading model…", "unload":"Unloading model…"}[action]
         self.changed.emit()
         def finished(status, data, error, _network):
             self.busy = False
             if 200 <= status < 300:
-                self.log({"load":"Model yüklendi.","reload":"Model yeniden yüklendi.","unload":"Model bellekten kaldırıldı."}[action])
-                self.detail = "Model işlemi tamamlandı."
+                self.log({"load":"Model loaded.","reload":"Model reloaded.","unload":"Model unloaded from memory."}[action])
+                self.detail = "Model operation completed."
             else:
                 problem = data.get("error", {}) if isinstance(data, dict) else {}
                 message = problem.get("message", "") if isinstance(problem, dict) else str(problem)
-                self._fail(message or error or f"Model işlemi başarısız (HTTP {status}).")
+                self._fail(message or error or f"Model operation failed (HTTP {status}).")
             self.changed.emit()
             self.poll()
         self.api.request("action", "/v1/model/" + action, finished, payload, timeout=120000)
