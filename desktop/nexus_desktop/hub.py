@@ -6,25 +6,29 @@ API reference: https://huggingface.co/docs/huggingface_hub/en/package_reference/
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
+import html
 import json
 import os
 from pathlib import Path
 import re
 import ssl
+import stat
 import struct
 import threading
 import time
 from typing import Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit, urljoin
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 import uuid
 
-from PySide6.QtCore import Qt, QObject, Signal
+from PySide6.QtCore import Qt, QObject, Signal, QSize, QBuffer, QByteArray, QIODevice, QThread
+from PySide6.QtGui import QIcon, QImageReader, QPixmap
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
@@ -75,11 +79,12 @@ class _SafeRedirect(HTTPRedirectHandler):
     max_redirections = 5
     max_repeats = 2
 
-    def __init__(self, allow_local_http=False):
+    def __init__(self, allow_local_http=False, validator=_allowed_url):
         self.allow_local_http = allow_local_http
+        self.validator = validator
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        _allowed_url(newurl, self.allow_local_http)
+        self.validator(newurl, self.allow_local_http)
         redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
         if redirected:
             for header in ("Authorization", "Cookie", "Proxy-Authorization"):
@@ -207,16 +212,18 @@ class HubClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.allow_local_http = allow_local_http
+        self._validate_url = _allowed_url
         # No environment proxies, cookies, netrc, HF tokens or Nexus API keys.
         self.opener = build_opener(ProxyHandler({}), _SafeRedirect(allow_local_http),
                                    HTTPSHandler(context=ssl.create_default_context()))
 
     def _open(self, url):
-        _allowed_url(url, self.allow_local_http)
+        self._validate_url(url, self.allow_local_http)
         request = Request(url, headers={"User-Agent":"NexusDesktop/0.1", "Accept-Encoding":"identity"})
         try:
             return self.opener.open(request, timeout=self.timeout)
         except HTTPError as error:
+            error.close()
             if error.code in {401, 403}:
                 raise HubError("This model requires Hugging Face access approval or authentication. Public models only are supported here.") from error
             if error.code == 429:
@@ -413,6 +420,290 @@ def list_local_models(root: Path) -> list[Path]:
     return sorted(found, key=lambda p: str(p).lower())
 
 
+def _allowed_logo_url(url: str, allow_local_http=False):
+    """Avatar URLs must come from a profile API and stay on these HF hosts."""
+    p = urlsplit(url)
+    try:
+        port = p.port
+    except ValueError as error:
+        raise HubError("Invalid publisher image address.") from error
+    if p.username or p.password or p.fragment:
+        raise HubError("Invalid publisher image address.")
+    if allow_local_http and p.scheme == "http" and p.hostname == "127.0.0.1":
+        return
+    if (p.scheme != "https" or port not in {None, 443}
+            or p.hostname not in {"huggingface.co", "cdn-avatars.huggingface.co", "cdn-uploads.huggingface.co"}):
+        raise HubError("Publisher images must use a trusted Hugging Face HTTPS host.")
+
+
+def _author(value):
+    return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", value))
+
+
+class PublisherLogoClient(HubClient):
+    """Only public HF profile avatars; never inspect model cards or README images.
+
+    User overview schema: https://huggingface.co/.well-known/openapi.json
+    Organization overview uses the corresponding public organization endpoint.
+    """
+    MAX_METADATA_BYTES = 64 * 1024
+    MAX_IMAGE_BYTES = 1024 * 1024
+
+    def __init__(self, base_url="https://huggingface.co", timeout=5, allow_local_http=False):
+        super().__init__(base_url, timeout, allow_local_http)
+        self._validate_url = _allowed_logo_url
+        self.opener = build_opener(ProxyHandler({}),
+                                   _SafeRedirect(allow_local_http, _allowed_logo_url),
+                                   HTTPSHandler(context=ssl.create_default_context()))
+
+    def avatar(self, author: str, cancel: threading.Event) -> bytes | None:
+        if not _author(author):
+            return None
+        profile = None
+        for kind, key in (("users", "user"), ("organizations", "name")):
+            _check_cancel(cancel)
+            try:
+                profile = self._json(f"/api/{kind}/{quote(author, safe='')}/overview", cancel)
+            except HubError as error:
+                if isinstance(error.__cause__, HTTPError) and error.__cause__.code == 404:
+                    continue
+                raise
+            if not isinstance(profile, dict) or str(profile.get(key, "")).casefold() != author.casefold():
+                return None
+            break
+        if not isinstance(profile, dict):
+            return None
+        avatar = profile.get("avatarUrl")
+        if not isinstance(avatar, str) or not avatar or len(avatar) > 2048:
+            return None
+        url = urljoin(self.base_url + "/", avatar)
+        _allowed_logo_url(url, self.allow_local_http)
+        # HF's generated default avatars are SVG; use our trusted bundled fallback.
+        if urlsplit(url).path.lower().endswith(".svg"):
+            return None
+        deadline = time.monotonic() + 15
+        chunks, total = [], 0
+        with self._open(url) as response:
+            mime = response.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+            if mime not in {"image/png", "image/jpeg", "image/webp"}:
+                return None
+            length = response.headers.get("Content-Length")
+            if length is not None and (not length.isdigit() or int(length) > self.MAX_IMAGE_BYTES):
+                return None
+            while True:
+                _check_cancel(cancel)
+                if time.monotonic() > deadline:
+                    raise HubError("Publisher image request timed out.")
+                chunk = response.read1(min(65536, self.MAX_IMAGE_BYTES + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > self.MAX_IMAGE_BYTES:
+                    return None
+                chunks.append(chunk)
+        _check_cancel(cancel)
+        return b"".join(chunks)
+
+
+def _decode_logo(data: bytes):
+    """Decode bounded raster data only on the GUI thread and normalize to PNG."""
+    app = QApplication.instance()
+    if app is None or QThread.currentThread() != app.thread():
+        raise RuntimeError("Publisher images must be decoded on the GUI thread.")
+    if not isinstance(data, bytes) or not data or len(data) > PublisherLogoClient.MAX_IMAGE_BYTES:
+        return None
+    buffer = QBuffer()
+    buffer.setData(QByteArray(data))
+    buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+    reader = QImageReader(buffer)
+    reader.setDecideFormatFromContent(True)
+    if bytes(reader.format()).lower() not in {b"png", b"jpeg", b"webp"}:
+        return None
+    size = reader.size()
+    if not size.isValid() or size.width() > 1024 or size.height() > 1024:
+        return None
+    reader.setScaledSize(size.scaled(QSize(32, 32), Qt.AspectRatioMode.KeepAspectRatio))
+    image = reader.read()
+    if image.isNull():
+        return None
+    image = image.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    encoded = QBuffer()
+    encoded.open(QIODevice.OpenModeFlag.WriteOnly)
+    if not image.save(encoded, "PNG"):
+        return None
+    return QIcon(QPixmap.fromImage(image)), bytes(encoded.data())
+
+
+class _LogoSignals(QObject):
+    received = Signal(str, object, bool)
+    stored = Signal(str)
+
+
+class LogoCache(QObject):
+    """Two separate workers, bounded requests, and a small private raster cache."""
+    updated = Signal(str)
+    MAX_PENDING = 32
+    MAX_ICONS = 128
+    AUTHOR_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+    STATE_ROLE = int(Qt.ItemDataRole.UserRole) + 2
+
+    def __init__(self, cache_dir: Path | None = None, parent=None):
+        super().__init__(parent)
+        fallback = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else fallback / "nexus-desktop/logos"
+        self.client = PublisherLogoClient()
+        self.fallback_icon = QIcon(str(Path(__file__).parent / "assets/huggingface.svg"))
+        self._icons = OrderedDict()
+        self._failed = OrderedDict()
+        self._pending = {}
+        self._closed = False
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nexus-logos")
+        self._signals = _LogoSignals(self)
+        self._signals.received.connect(self._received)
+        self._signals.stored.connect(self._stored)
+
+    @staticmethod
+    def _filename(author):
+        return hashlib.sha256(author.casefold().encode()).hexdigest() + ".png"
+
+    def has_logo(self, author):
+        return author.casefold() in self._icons if isinstance(author, str) else False
+
+    def icon(self, author: str) -> QIcon:
+        if not _author(author):
+            return self.fallback_icon
+        author = author.casefold()
+        if author in self._icons:
+            self._icons.move_to_end(author)
+            return self._icons[author]
+        failed = self._failed.get(author, 0)
+        if (not self._closed and author not in self._pending
+                and len(self._pending) < self.MAX_PENDING and time.monotonic() >= failed):
+            cancel = threading.Event()
+            self._pending[author] = cancel
+            self._executor.submit(self._load, author, cancel)
+        return self.fallback_icon
+
+    def _read_cache(self, author):
+        # Opening components without following links also keeps the cache private.
+        directory = _directory_fd(self.cache_dir)
+        try:
+            os.fchmod(directory, 0o700)
+            fd = os.open(self._filename(author), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            with os.fdopen(fd, "rb") as source:
+                metadata = os.fstat(source.fileno())
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > self.client.MAX_IMAGE_BYTES:
+                    return None
+                return source.read(self.client.MAX_IMAGE_BYTES + 1)
+        finally:
+            os.close(directory)
+
+    def _load(self, author, cancel, skip_cache=False):
+        payload, cached = None, False
+        try:
+            _check_cancel(cancel)
+            if not skip_cache:
+                try:
+                    payload = self._read_cache(author)
+                    cached = payload is not None
+                except OSError:
+                    pass
+            if payload is None:
+                payload = self.client.avatar(author, cancel)
+            _check_cancel(cancel)
+        except Exception:
+            payload = None
+        try:
+            self._signals.received.emit(author, payload, cached)
+        except RuntimeError:
+            pass
+
+    def _received(self, author, payload, cached):
+        if self._closed or author not in self._pending:
+            return
+        decoded = _decode_logo(payload) if isinstance(payload, bytes) else None
+        if decoded is None and cached:
+            self._executor.submit(self._load, author, self._pending[author], True)
+            return
+        if decoded is None:
+            self._pending.pop(author, None)
+            self._failed[author] = time.monotonic() + 60
+            while len(self._failed) > self.MAX_ICONS:
+                self._failed.popitem(last=False)
+        else:
+            icon, normalized = decoded
+            self._icons[author] = icon
+            while len(self._icons) > self.MAX_ICONS:
+                self._icons.popitem(last=False)
+            if cached:
+                self._pending.pop(author, None)
+            else:
+                self._executor.submit(self._store, author, normalized, self._pending[author])
+        self.updated.emit(author)
+
+    def _store(self, author, data, cancel):
+        directory, temporary = None, None
+        try:
+            _check_cancel(cancel)
+            directory = _directory_fd(self.cache_dir)
+            os.fchmod(directory, 0o700)
+            temporary = ".logo-" + uuid.uuid4().hex + ".part"
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            with os.fdopen(fd, "wb") as target:
+                target.write(data)
+            _check_cancel(cancel)
+            os.replace(temporary, self._filename(author), src_dir_fd=directory, dst_dir_fd=directory)
+            temporary = None
+            entries = []
+            with os.scandir(directory) as scan:
+                for item in scan:
+                    if len(entries) >= 512:
+                        break
+                    if re.fullmatch(r"[a-f0-9]{64}\.png", item.name) and item.is_file(follow_symlinks=False):
+                        entries.append((item.stat(follow_symlinks=False).st_mtime_ns, item.name))
+            for _, name in sorted(entries)[:-self.MAX_ICONS]:
+                os.unlink(name, dir_fd=directory)
+        except (HubError, OSError):
+            pass  # A read-only/unavailable cache must not hide an in-memory logo.
+        finally:
+            if directory is not None:
+                if temporary:
+                    try:
+                        os.unlink(temporary, dir_fd=directory)
+                    except OSError:
+                        pass
+                os.close(directory)
+            try:
+                self._signals.stored.emit(author)
+            except RuntimeError:
+                pass
+
+    def _stored(self, author):
+        self._pending.pop(author, None)
+
+    def shutdown(self):
+        if self._closed:
+            return
+        self._closed = True
+        for cancel in self._pending.values():
+            cancel.set()
+        self._pending.clear()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _local_repository(path: Path, root: Path) -> str:
+    try:
+        relative = path.relative_to(root).parts
+        if len(relative) < 4 or not re.fullmatch(r"[a-fA-F0-9]{40}", relative[2]):
+            return ""
+        repo = "/".join(relative[:2])
+        _parts(repo, repo=True)
+        _parts("/".join(relative[3:]))
+        return repo
+    except (ValueError, HubError):
+        return ""
+
+
 def _size(value):
     if not isinstance(value, int) or value <= 0:
         return "size unavailable"
@@ -437,6 +728,8 @@ class ModelHubPanel(QWidget):
         fallback = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "nexus/models"
         self.download_dir = Path(download_dir or os.environ.get("NEXUS_MODELS_DIR") or fallback).absolute()
         self.client = HubClient()
+        self.logo_cache = LogoCache(parent=self)
+        self.logo_cache.updated.connect(self._logo_updated)
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nexus-hub")
         self._signals = _WorkerSignals(self)
         self._signals.done.connect(self._finished)
@@ -483,6 +776,7 @@ class ModelHubPanel(QWidget):
             widget = QListWidget()
             widget.setObjectName(name)
             widget.setMinimumHeight(150)
+            widget.setIconSize(QSize(32, 32))
             setattr(self, attr, widget)
             column.addWidget(widget)
             columns.addLayout(column, 1)
@@ -524,6 +818,7 @@ class ModelHubPanel(QWidget):
         self.local_files = QListWidget()
         self.local_files.setMinimumHeight(110)
         self.local_files.setObjectName("hubLocalFiles")
+        self.local_files.setIconSize(QSize(32, 32))
         self.local_files.currentItemChanged.connect(lambda *_: self.load_button.setEnabled(self.local_files.currentItem() is not None))
         layout.addWidget(self.local_files)
         self.load_button = QPushButton("Load selected model")
@@ -534,6 +829,28 @@ class ModelHubPanel(QWidget):
         self.directory_label = self._label(str(self.download_dir), "subtitle")
         self.directory_label.setToolTip("Model library directory. For Docker, mount this same absolute path in the server container.")
         layout.addWidget(self.directory_label)
+
+    def _item_logo(self, item, author="", path=""):
+        item.setData(LogoCache.AUTHOR_ROLE, author)
+        item.setIcon(self.logo_cache.icon(author))
+        item.setData(LogoCache.STATE_ROLE, "publisher" if self.logo_cache.has_logo(author) else "fallback")
+        tooltip = f"Publisher: {author}" if author else "Hugging Face · publisher unknown"
+        if path:
+            tooltip += "\n" + str(path)
+        # Tooltips may interpret rich text; escape all file/repository-derived text.
+        item.setToolTip("<qt>" + html.escape(tooltip).replace("\n", "<br>") + "</qt>")
+
+    def _logo_updated(self, author):
+        if self._closed:
+            return
+        # Find current rows instead of retaining deleted QListWidgetItem wrappers.
+        for widget in (self.results, self.file_list, self.local_files):
+            for index in range(widget.count()):
+                item = widget.item(index)
+                owner = item.data(LogoCache.AUTHOR_ROLE) or ""
+                if owner.casefold() == author:
+                    item.setIcon(self.logo_cache.icon(owner))
+                    item.setData(LogoCache.STATE_ROLE, "publisher" if self.logo_cache.has_logo(owner) else "fallback")
 
     def _submit(self, kind, operation):
         if self._closed or kind in self._jobs or len(self._jobs) >= 2:
@@ -644,12 +961,14 @@ class ModelHubPanel(QWidget):
             for repo in result:
                 item = QListWidgetItem(f"{repo['id']}\n{repo['downloads']:,} downloads")
                 item.setData(Qt.ItemDataRole.UserRole, repo["id"])
+                self._item_logo(item, repo["id"].split("/", 1)[0])
                 self.results.addItem(item)
             self.status.setText(f"{len(result)} repositories found. Select one to browse files." if result else "No GGUF repositories found. Try a different search.")
         elif kind == "files":
             for file in result:
                 item = QListWidgetItem(f"{file.name}\n{_size(file.size)}" + (" · split file, unsupported" if file.split else ""))
                 item.setData(Qt.ItemDataRole.UserRole, file)
+                self._item_logo(item, file.repo.split("/", 1)[0])
                 self.file_list.addItem(item)
             self.status.setText(f"{len(result)} GGUF files shown (up to 200). Select a file to download." if result else "This repository has no GGUF files.")
         elif kind == "download":
@@ -660,8 +979,10 @@ class ModelHubPanel(QWidget):
         elif kind == "local":
             self.local_files.clear()
             for path in result:
-                item = QListWidgetItem(str(path.relative_to(self.download_dir)))
+                repo = _local_repository(path, self.download_dir)
+                item = QListWidgetItem(path.name + ("\n" + repo if repo else "\nLocal model"))
                 item.setData(Qt.ItemDataRole.UserRole, str(path))
+                self._item_logo(item, repo.split("/", 1)[0] if repo else "", path)
                 self.local_files.addItem(item)
                 if str(path) == getattr(self, "_select_local", ""):
                     self.local_files.setCurrentItem(item)
@@ -708,6 +1029,7 @@ class ModelHubPanel(QWidget):
         if self._closed:
             return
         self._closed = True
+        self.logo_cache.shutdown()
         for _, cancel in self._jobs.values():
             cancel.set()
         self._jobs.clear()

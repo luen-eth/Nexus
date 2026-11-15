@@ -1,0 +1,4 @@
+Hugging Face fallback logo
+Source: https://huggingface.co/front/assets/huggingface_logo-noborder.svg
+Retrieved: 2026-11-15
+Used to identify Hugging Face models when a publisher avatar is unavailable.

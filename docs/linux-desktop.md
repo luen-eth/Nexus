@@ -15,7 +15,7 @@ The GUI uses Python 3.11+ and PySide6 6.8+. Debian 13 provides the split [`pytho
 
 A `.deb` is not an Arch package. Arch-built engine binaries are not bundled into the `.deb`: their OpenSSL SONAME and glibc/libstdc++ symbol requirements belong to the Arch build environment. Debian-family users should build the engine on their target distribution or connect to an existing compatible local server. The native package manifest records the actual ELF `NEEDED`, GLIBC, GLIBCXX, CXXABI and GCC requirements. CUDA additionally needs an NVIDIA GPU/driver capable of loading the checked-in `sm_80` / PTX 9.4 kernel; CUDA toolkit/NVRTC is not required. The hardware acceptance in this work used an RTX 5070. CPU operation does not require an NVIDIA driver.
 
-Version 0.2.0 was additionally checked on Arch Linux with 42 GUI tests, extracted Arch/Deb package entrypoints and window lifecycle checks, and live Docker/CUDA chat. A public 145 MB SmolLM GGUF download was verified, loaded through the Models page and used for a streamed reply. Per-answer token counts come from the server; elapsed time includes queueing, prompt processing and transfer, so tokens/s is the average across the whole request.
+Version 0.2.0 was additionally checked on Arch Linux with 47 GUI tests, extracted Arch/Deb package entrypoints and window lifecycle checks, and live Docker/CUDA chat. A public 145 MB SmolLM GGUF download was verified, loaded through the Models page and used for a streamed reply. Per-answer token counts come from the server; elapsed time includes queueing, prompt processing and transfer, so tokens/s is the average across the whole request.
 
 ## Initial 0.1.0 runtime matrix (15 November 2026)
 

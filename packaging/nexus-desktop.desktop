@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=Nexus
-GenericName=Local AI Server Manager
-Comment=Manage a local Nexus AI server and GGUF models
+GenericName=Local AI Workspace
+Comment=Chat with local models, discover GGUF models and manage a local server
 Exec=nexus-desktop
 TryExec=nexus-desktop
 Icon=nexus-desktop

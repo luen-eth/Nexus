@@ -18,7 +18,7 @@ def install_signal_handlers(application, window):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="nexus-desktop", description="Nexus local server manager · Linux / Qt 6")
+    parser = argparse.ArgumentParser(prog="nexus-desktop", description="Nexus local AI workspace · Linux / Qt 6")
     parser.add_argument("--version", action="version", version=f"Nexus Desktop {__version__}")
     parser.add_argument("--server", help="Path to the nexus-server executable")
     parser.add_argument("--model", help="Path to a GGUF model file")

@@ -18,7 +18,7 @@ from PySide6.QtCore import QEvent, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QListWidgetItem
 from nexus_desktop.hub import (
-    Cancelled, HubClient, HubError, HubFile, ModelHubPanel,
+    Cancelled, HubClient, HubError, HubFile, ModelHubPanel, PublisherLogoClient,
     _allowed_url, inspect_gguf, list_local_models,
 )
 
@@ -207,8 +207,10 @@ class HubTests(unittest.TestCase):
             self.client.files("owner/repository", self.cancel)
 
     def panel(self):
-        panel = ModelHubPanel(None, str(self.root))
+        with patch.dict(os.environ, {"XDG_CACHE_HOME":str(Path(self.temp.name) / "cache")}):
+            panel = ModelHubPanel(None, str(self.root))
         panel.client = self.client
+        panel.logo_cache.client = PublisherLogoClient(self.client.base_url, timeout=.3, allow_local_http=True)
         self.panels.append(panel)
         self.assertTrue(wait(lambda:"local" not in panel._jobs))
         return panel
