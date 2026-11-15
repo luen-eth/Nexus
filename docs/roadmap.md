@@ -17,3 +17,41 @@ The current release establishes a checked LLaMA inference path, CPU/CUDA numeric
 | P3 | Speculative decoding and additional architectures | Quality/performance reference corpus | Correct target-distribution behavior and measured net benefit; architecture-specific load/attention/RoPE tests |
 
 For each implementation, preserve the existing regression gates, capture an unchanged baseline binary and source revision, and record the model hash and execution settings. Report end-to-end improvements separately from microbenchmarks. Changes that increase precision loss or memory demand need an explicit compatibility note. Production operation, remote deployment and model distribution are separate from this source and desktop package release.
+
+
+## Suggested implementation order
+
+1. **Freeze the quality baseline.** Extend the existing pinned reference assets and
+   real-model checks before changing weight precision. Add ordinary text/chat
+   prompts, longer outputs, GQA/context boundaries and multiple supported LLaMA
+   sizes. Keep model/tokenizer revisions and precision explicit. A tokenizer
+   fixture for another family does not qualify its inference architecture.
+2. **Develop packed CPU weights and GPU residency in separate branches.** The CPU
+   work should introduce an explicit weight-storage representation before adding
+   block matvec kernels; the current backend contract accepts F32 vectors. The
+   GPU work should first measure transfer bytes, then move activations/KV and
+   attention to the device. Preserve atomic replacement and bounded workspaces
+   in both paths. Merge each only after its independent numerical reference and
+   matched-model memory/latency comparison pass.
+3. **Validate service behavior with the resulting memory model.** Re-run mixed
+   short/long requests, cancellation, slow consumers and repeated replacement.
+   Record RSS, swap, allocator observations and per-process VRAM separately.
+   Bound admission/cancellation latency and verify empty final queues and KV
+   ownership. Compare throughput only under an isolated, documented workload.
+4. **Add actual batching after backend support exists.** Scheduler interleaving
+   alone is not batching. Matrix/matrix execution must preserve each session's
+   RNG, KV, stop handling and model identity; publish both throughput and p95
+   latency changes for mixed request sizes.
+
+Parser fault testing and desktop distribution can proceed alongside the compute
+work. The parser track owns minimized malformed inputs and interrupted/disk-full
+I/O recovery. The desktop track owns Wayland/X11/HiDPI/accessibility checks,
+clean install/upgrade/uninstall and signing. Dependency maintenance owns the
+remaining transitive `paste` warning and verifies tokenizer goldens after its
+upstream replacement. None of these tracks should weaken a correctness gate to
+obtain a performance result.
+
+A reviewable change should include the baseline revision/binary hash, the final
+source revision, exact reproduction command, model hash, numerical tolerance,
+measured result and compatibility impact. Publish a supported feature only when
+its acceptance evidence exists; otherwise retain the explicit unsupported path.

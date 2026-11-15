@@ -169,6 +169,36 @@ it on the async reactor. No process-global malloc tuning or forced malloc trim
 is used. Regression tests cover idle reuse, serialization, queue capacity,
 cancellation, panic recovery and nonblocking shutdown.
 
+## Recorded 30-minute service acceptance
+
+The final server binary (`b7fbfa8c8fea016d23181c550a55adb6aff8d25130b1de44cfddd41b562449f5`)
+completed 1,805.22 seconds of mixed CUDA workload with the model above, F32 KV,
+context 256 and concurrency 1/2/4/8. The [sanitized run record](validation/2026-11-15-soak.json)
+contains the settings, executed harness hash, counts and memory series.
+
+| Observation | Result |
+| --- | ---: |
+| HTTP calls, including expected rejection/lifecycle cases | 3,584 |
+| Nonempty completed JSON/SSE/slow-reader generations | 2,432 |
+| Server-confirmed cancellations | 512 |
+| Successful load / reload / unload operations | 64 each |
+| Unexpected request or sampling failures | 0 |
+| Final queued/running requests, active sessions and session KV bytes/pages | 0 |
+
+The worker/backend remained healthy and the owned test server exited after the
+final drain. Expected 400/401/503 responses were negative tests. This is a
+protocol/lifecycle acceptance run; development builds and package checks
+sometimes overlapped, so its timings are not an isolated capacity benchmark.
+
+Linux high-water RSS was 1,982,400 KiB; sampled RSS peaked at 1,862,544 KiB.
+At final drain, RSS was 1,261,644 KiB. Supplemental swap observations started
+at 15:40 UTC, about fourteen minutes into the workload: the last observation
+contained 461,448 KiB of swap, making RSS + swap 1,723,092 KiB. The decrease in
+RSS alone is therefore not a memory-saving result, and there is no complete
+first-half swap series. Sampled GPU memory peaked at 1,218 MiB during replacement
+and ended at 706 MiB. Protocol success, empty final queues and these bounded
+observations do not prove absence of all leaks or guarantee other model sizes.
+
 ## Dependency advisory check
 
 The locked dependency graph was checked with cargo-audit 0.23.0 against the
