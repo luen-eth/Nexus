@@ -1,0 +1,88 @@
+{
+  "version": "0.1.0",
+  "package_release": "1",
+  "source_date_epoch": 1794700800,
+  "artifacts": [
+    {
+      "kind": "arch-gui",
+      "path": "arch/nexus-desktop/nexus-desktop-0.1.0-1-any.pkg.tar.zst",
+      "sha256": "d59bca4b484cb858c9a2dc0170bef68485afbecd1f812d5813349ffd1b3c1453"
+    },
+    {
+      "kind": "deb-gui",
+      "path": "debian/nexus-desktop_0.1.0-1_all.deb",
+      "sha256": "2b816242659baf4582eb9a9b33deaaf0f9f55c735b3eccf2d71de5bfd3bf9f1f"
+    },
+    {
+      "kind": "arch-engine",
+      "path": "arch/nexus-engine-cuda/nexus-engine-cuda-0.1.0-1-x86_64.pkg.tar.zst",
+      "sha256": "dd1798974b97eda33c3efbb3e0bd7dee230e0f6de918e6f73e41aa4cac448c0d"
+    }
+  ],
+  "engine_flavor": "cuda",
+  "engine_dependencies": [
+    "glibc>=2.39",
+    "libcrypto.so=4-64",
+    "libgcc",
+    "libssl.so=4-64",
+    "libstdc++>=16.2.1+r23+gd564253eb6c8-1"
+  ],
+  "engine_binaries": {
+    "nexus": {
+      "sha256": "4a77ead400f4ec596c27e84a630c433a3ddecc14ccffad93adc322fe3de35814",
+      "needed": [
+        "libssl.so.4",
+        "libcrypto.so.4",
+        "libstdc++.so.6",
+        "libgcc_s.so.1",
+        "libm.so.6",
+        "libc.so.6",
+        "ld-linux-x86-64.so.2"
+      ],
+      "required_versions": {
+        "GLIBC": "GLIBC_2.39",
+        "GLIBCXX": "GLIBCXX_3.4.31",
+        "CXXABI": "CXXABI_1.3.13",
+        "GCC": "GCC_4.2.0"
+      }
+    },
+    "nexus-server": {
+      "sha256": "b7fbfa8c8fea016d23181c550a55adb6aff8d25130b1de44cfddd41b562449f5",
+      "needed": [
+        "libstdc++.so.6",
+        "libgcc_s.so.1",
+        "libm.so.6",
+        "libc.so.6",
+        "ld-linux-x86-64.so.2"
+      ],
+      "required_versions": {
+        "GLIBC": "GLIBC_2.38",
+        "GLIBCXX": "GLIBCXX_3.4.31",
+        "CXXABI": "CXXABI_1.3.13",
+        "GCC": "GCC_4.2.0"
+      }
+    },
+    "nexus-convert": {
+      "sha256": "34a74886bb65f03c8562d4bfeea25ce4eb685679c5fff9e8b230a5f166f3f974",
+      "needed": [
+        "libstdc++.so.6",
+        "libgcc_s.so.1",
+        "libc.so.6",
+        "ld-linux-x86-64.so.2"
+      ],
+      "required_versions": {
+        "GLIBC": "GLIBC_2.34",
+        "GLIBCXX": "GLIBCXX_3.4.29",
+        "CXXABI": "CXXABI_1.3.9",
+        "GCC": "GCC_4.2.0"
+      }
+    }
+  },
+  "package_reproducibility": "Two builds using the same frozen binaries, GUI files, paths and packaging tools were byte-identical. Native Rust compilation reproducibility is not claimed.",
+  "gui_validation": [
+    "Arch Linux / PySide6 6.12",
+    "Debian 13 / PySide6 6.8.2.1 / 19 tests passed",
+    "Ubuntu 26.04 / PySide6 6.10.2"
+  ],
+  "deb_scope": "GUI only; a compatible engine must be built on the target distribution or separately available."
+}

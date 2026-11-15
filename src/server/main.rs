@@ -1,13 +1,12 @@
 //! Nexus API Server - OpenAI-compatible HTTP server.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use std::path::PathBuf;
 
-use nexus::backend::BackendType;
 use nexus::engine::{InferenceConfig, InferenceEngine};
 use nexus::quant::{KvQuantType, QuantFormat};
-use nexus::server::ServerConfig;
+use nexus::server::{parse_backend, ServerConfig};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -20,8 +19,8 @@ struct Cli {
     #[arg(short, long)]
     model: Option<PathBuf>,
 
-    /// Host to bind to
-    #[arg(long, default_value = "0.0.0.0")]
+    /// Host to bind to; use --host 0.0.0.0 to expose the API on other interfaces.
+    #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
     /// Port to listen on
@@ -36,13 +35,22 @@ struct Cli {
     #[arg(long, default_value = "tq_3b2b")]
     kv_quant: String,
 
-    /// Weight quantization format
-    #[arg(long, default_value = "Q4_K")]
+    /// Runtime weight storage (f32 only). GGUF file codecs are detected automatically.
+    #[arg(long, default_value = "f32")]
     weight_quant: String,
 
-    /// Backend to use
+    /// Backend: cpu, or cuda with --features cuda. "auto" selects cpu.
     #[arg(long, default_value = "auto")]
     backend: String,
+
+    /// Maximum sequences decoded concurrently (token-interleaved on the CPU).
+    /// Each active sequence owns its own KV cache. Excess requests queue up to
+    /// 4x this value; beyond that the server answers 503.
+    #[arg(long, default_value_t = 4)]
+    batch_size: usize,
+    /// Allow byte tokenization only for synthetic test fixtures.
+    #[arg(long)]
+    allow_byte_tokenizer: bool,
 
     /// Maximum tensor elements to eagerly load; 0 means no cap.
     #[arg(long)]
@@ -56,7 +64,8 @@ struct Cli {
     #[arg(long, env = "NEXUS_CORS_ORIGIN")]
     cors_origin: Option<String>,
 
-    /// Per-minute request limit per forwarded IP. Also configurable through NEXUS_RATE_LIMIT_PER_MINUTE.
+    /// Per-minute request limit per client IP (TCP peer address; forwarding
+    /// headers are ignored). Also configurable through NEXUS_RATE_LIMIT_PER_MINUTE.
     #[arg(long, env = "NEXUS_RATE_LIMIT_PER_MINUTE")]
     rate_limit_per_minute: Option<usize>,
 }
@@ -73,17 +82,29 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Parse configuration
-    let kv_quant_type = KvQuantType::from_str(&cli.kv_quant).unwrap_or(KvQuantType::TurboQuant3b2b);
-    let weight_format = QuantFormat::from_str(&cli.weight_quant).unwrap_or(QuantFormat::Q4_K);
-
-    let backend_type = match cli.backend.as_str() {
-        "cpu" | "cpu-simd" => BackendType::CpuSimd,
-        "metal" => BackendType::Metal,
-        _ => BackendType::default(),
-    };
+    let kv_quant_type = KvQuantType::from_str(&cli.kv_quant.to_ascii_lowercase().replace('-', "_"))
+        .ok_or_else(|| anyhow!("Unsupported KV quantization: {}", cli.kv_quant))?;
+    let weight_name = cli.weight_quant.to_ascii_uppercase().replace('-', "_");
+    let weight_format = QuantFormat::from_str(if weight_name == "F32" {
+        "FP32"
+    } else {
+        &weight_name
+    })
+    .ok_or_else(|| anyhow!("Unsupported runtime weight storage: {}", cli.weight_quant))?;
+    if weight_format != QuantFormat::FP32 {
+        return Err(anyhow!(
+            "Runtime weight storage supports only f32; GGUF file codecs are detected automatically"
+        ));
+    }
+    let backend_type = parse_backend(&cli.backend).map_err(|err| anyhow!("{err}"))?;
+    if cli.batch_size == 0 {
+        return Err(anyhow!("--batch-size must be at least 1"));
+    }
 
     let config = InferenceConfig {
         max_seq_len: cli.ctx_size,
+        allow_byte_tokenizer: cli.allow_byte_tokenizer,
+        batch_size: cli.batch_size,
         kv_quant: kv_quant_type,
         weight_format,
         backend: backend_type,
@@ -96,17 +117,25 @@ async fn main() -> Result<()> {
     };
 
     // Create engine
-    let mut engine = InferenceEngine::new(Some(config));
+    let mut engine = InferenceEngine::new(Some(config.clone()));
 
-    // Load model if specified
+    // Load model if specified (synchronous file I/O; keep it off the reactor).
     if let Some(model_path) = &cli.model {
         println!("Loading model: {}", model_path.display());
-        match engine.load_model(model_path) {
+        let path = model_path.clone();
+        let (loaded, result) = tokio::task::spawn_blocking(move || {
+            let result = engine.load_model(&path);
+            (engine, result)
+        })
+        .await?;
+        match result {
             Ok(()) => {
+                engine = loaded;
                 println!("Model loaded successfully.");
                 println!("{}", engine.info());
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                engine = InferenceEngine::new(Some(config.clone()));
                 eprintln!("Model file not found: {}", model_path.display());
                 eprintln!();
                 eprintln!("Starting server without model. Load a model with --model <path>");
@@ -125,8 +154,15 @@ async fn main() -> Result<()> {
     };
 
     // Start server
-    nexus::server::run_server_with_config(engine, &cli.host, cli.port, server_config, cli.model)
-        .await?;
+    nexus::server::run_server_with_requested_config(
+        engine,
+        &cli.host,
+        cli.port,
+        server_config,
+        cli.model,
+        config,
+    )
+    .await?;
 
     Ok(())
 }

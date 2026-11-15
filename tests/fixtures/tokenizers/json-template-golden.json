@@ -1,0 +1,22 @@
+[
+  {
+    "template": "{{ messages | tojson }}",
+    "rendered": "[{\"role\": \"user\", \"content\": \"<>&' Türkçe 🙂\"}]"
+  },
+  {
+    "template": "{{ messages | tojson(ensure_ascii=true) }}",
+    "rendered": "[{\"role\": \"user\", \"content\": \"<>&' T\\u00fcrk\\u00e7e \\ud83d\\ude42\"}]"
+  },
+  {
+    "template": "{{ messages | tojson(indent=2,sort_keys=true) }}",
+    "rendered": "[\n  {\n    \"content\": \"<>&' Türkçe 🙂\",\n    \"role\": \"user\"\n  }\n]"
+  },
+  {
+    "template": "{{ messages | tojson(separators=(',', ':')) }}",
+    "rendered": "[{\"role\":\"user\",\"content\":\"<>&' Türkçe 🙂\"}]"
+  },
+  {
+    "template": "{{ messages | tojson(false, '\t', (',', ': '), true) }}",
+    "rendered": "[\n\t{\n\t\t\"content\": \"<>&' Türkçe 🙂\",\n\t\t\"role\": \"user\"\n\t}\n]"
+  }
+]

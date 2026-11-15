@@ -4,28 +4,27 @@ version = "0.1.0"
 edition = "2021"
 description = "High-performance AI inference engine combining TurboQuant, llama.cpp, and MLX best practices"
 authors = ["Nexus Contributors"]
-license = "MIT"
-rust-version = "1.75"
+license = "Apache-2.0"
+rust-version = "1.88"
 
 [workspace]
 members = [".", "tools/nexus-convert"]
 
 [dependencies]
 # Serialization
-bincode = "2.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # HTTP Server
 axum = { version = "0.7", features = ["json"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 
 # SIMD / Math
 bytemuck = "1.14"
-num-traits = "0.2"
 rand = "0.8"
 rayon = "1.10"
 
@@ -33,40 +32,42 @@ rayon = "1.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Metal (Apple Silicon) - optional
-metal = { version = "0.29", optional = true }
-
 # Utilities
-anyhow = "1.0"
-thiserror = "2.0"
-memmap2 = "0.9"
+anyhow = "1.0.103"
+memmap2 = "0.9.11"
 dirs = "5.0"
 num_cpus = "1.16"
 
 # HTTP / Download
-reqwest = { version = "0.11", features = ["stream"] }
+reqwest = { version = "0.12.28", features = ["stream"] }
 futures-util = "0.3"
 
 # FP16 support for MLX
 half = "2.4"
-
-# Compression for GGUF
-flate2 = "1.0"
 
 # UUID for request IDs
 uuid = { version = "1.0", features = ["v4"] }
 
 # Time
 chrono = "0.4"
+cudarc = { version = "0.19.10", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12000"] }
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
+llama-cpp-2 = { version = "0.1.161", default-features = false }
+minijinja = { version = "3.0.5", features = ["json", "fuel", "serde", "loop_controls", "preserve_order"] }
+minijinja-contrib = { version = "3.0.5", features = ["pycompat"] }
+
+# Metal device probing is only available on Apple targets.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.29", optional = true }
 
 [dev-dependencies]
 tempfile = "3.0"
 
 [features]
-default = ["cpu-simd", "metal"]
+default = ["cpu-simd"]
 cpu-simd = []
 metal = ["dep:metal"]
-cuda = []
+cuda = ["dep:cudarc"]
 all-backends = ["cpu-simd", "metal", "cuda"]
 
 [[bin]]

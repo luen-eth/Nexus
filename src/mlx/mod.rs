@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use serde::Deserialize;
-use serde_json::Value;
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 // ============================================================================
 // Safetensors Header Format
@@ -37,7 +37,7 @@ pub struct TensorMeta {
 
 impl TensorMeta {
     pub fn num_elements(&self) -> usize {
-        self.shape.iter().product()
+        self.shape.iter().copied().fold(1, usize::saturating_mul)
     }
 
     pub fn elem_size(&self) -> usize {
@@ -47,14 +47,16 @@ impl TensorMeta {
             "I64" => 8,
             "I32" => 4,
             "I16" => 2,
-            "I8" => 1,
-            "U8" => 1,
-            _ => 4, // default to F32 size
+            "F64" | "U64" => 8,
+            "U32" => 4,
+            "U16" => 2,
+            "I8" | "U8" | "BOOL" => 1,
+            _ => 0, // Unsupported dtypes must never be guessed as F32.
         }
     }
 
     pub fn data_size(&self) -> usize {
-        self.num_elements() * self.elem_size()
+        self.num_elements().saturating_mul(self.elem_size())
     }
 }
 
@@ -87,162 +89,227 @@ impl MlxModelConfig {
 // Safetensors Parser
 // ============================================================================
 
-/// Parse a safetensors file header
+// Matches the safetensors format header limit. Check the actual file boundary
+// before reserving this memory; a forged length in an eight-byte file allocates nothing.
+const MAX_HEADER_BYTES: u64 = 100_000_000;
+const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTensorMeta {
+    dtype: String,
+    shape: Vec<u64>,
+    data_offsets: [u64; 2],
+}
+
+// Deserialize entries directly rather than via Value/HashMap, which silently
+// accept duplicate tensor keys (or duplicate dtype/shape/offset fields).
+struct RawHeader(HashMap<String, RawTensorMeta>);
+impl<'de> Deserialize<'de> for RawHeader {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct HeaderVisitor;
+        impl<'de> Visitor<'de> for HeaderVisitor {
+            type Value = RawHeader;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a safetensors header object")
+            }
+            fn visit_map<M: MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                let mut tensors = HashMap::new();
+                let mut seen_metadata = false;
+                while let Some(name) = map.next_key::<String>()? {
+                    if name == "__metadata__" {
+                        if seen_metadata {
+                            return Err(de::Error::custom("Duplicate __metadata__ entry"));
+                        }
+                        let _: HashMap<String, String> = map.next_value()?;
+                        seen_metadata = true;
+                    } else {
+                        if tensors.contains_key(&name) {
+                            return Err(de::Error::custom(format!("Duplicate tensor: {name}")));
+                        }
+                        tensors.insert(name, map.next_value::<RawTensorMeta>()?);
+                    }
+                }
+                Ok(RawHeader(tensors))
+            }
+        }
+        deserializer.deserialize_map(HeaderVisitor)
+    }
+}
+
+/// Parse and validate all tensor ranges before any tensor payload is allocated.
 pub fn parse_safetensors_header(path: &Path) -> Result<SafeTensorsHeader> {
     let file = File::open(path).context("Failed to open safetensors file")?;
+    let file_len = file.metadata()?.len();
     let mut reader = io::BufReader::new(file);
-
-    // Read the header size (8 bytes, little-endian u64)
     let mut size_buf = [0u8; 8];
     reader
         .read_exact(&mut size_buf)
         .context("Failed to read header size")?;
     let header_size = u64::from_le_bytes(size_buf);
-
-    if header_size == 0 || header_size > 100_000_000 {
-        anyhow::bail!(
-            "Invalid header size: {} (possible corrupted file)",
-            header_size
-        );
+    let data_base = header_size
+        .checked_add(8)
+        .context("Safetensors header offset overflow")?;
+    if header_size == 0 || header_size > MAX_HEADER_BYTES || data_base > file_len {
+        anyhow::bail!("Invalid header size: {header_size} (file bytes: {file_len}, budget: {MAX_HEADER_BYTES})");
     }
-
-    // Read the header JSON
-    let mut header_bytes = vec![0u8; header_size as usize];
+    let header_len = usize::try_from(header_size).context("Header size exceeds address space")?;
+    let mut header_bytes = Vec::new();
+    header_bytes
+        .try_reserve_exact(header_len)
+        .context("Unable to allocate safetensors header")?;
+    header_bytes.resize(header_len, 0);
     reader
         .read_exact(&mut header_bytes)
         .context("Failed to read header bytes")?;
-
-    // Parse JSON - skip the __metadata__ entry if present
-    let json_str = std::str::from_utf8(&header_bytes).context("Header is not valid UTF-8")?;
-
-    // Parse the tensor metadata. Safetensors stores each tensor as:
-    // { "dtype": "BF16", "shape": [..], "data_offsets": [start, end] }.
-    let tensors: HashMap<String, Value> =
-        serde_json::from_str(json_str).context("Failed to parse safetensors JSON")?;
-
-    // Extract tensor names and metadata
-    let mut tensor_names = Vec::new();
-    let mut tensor_map = HashMap::new();
-    let data_base = 8u64 + header_size;
-
-    // Sort tensor names for consistent ordering
-    let mut sorted_keys: Vec<String> = tensors.keys().cloned().collect();
-    sorted_keys.sort();
-
-    for name in &sorted_keys {
-        if name == "__metadata__" {
-            continue;
-        }
-        let entry = &tensors[name];
-        tensor_names.push(name.clone());
-
-        let dtype = entry
-            .get("dtype")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Missing dtype for tensor {}", name))?
-            .to_string();
-        let shape: Vec<usize> = entry
-            .get("shape")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("Missing shape for tensor {}", name))?
-            .iter()
-            .map(|v| v.as_u64().map(|n| n as usize))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| anyhow::anyhow!("Invalid shape for tensor {}", name))?;
-        let offsets = entry
-            .get("data_offsets")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("Missing data_offsets for tensor {}", name))?;
-        if offsets.len() != 2 {
-            anyhow::bail!("Invalid data_offsets for tensor {}", name);
-        }
-        let start = offsets[0]
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("Invalid start offset for tensor {}", name))?;
-        let end = offsets[1]
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("Invalid end offset for tensor {}", name))?;
-        let data_size = (end - start) as usize;
-
-        tensor_map.insert(
-            name.clone(),
-            TensorMeta {
-                dtype,
-                shape,
-                data_offset: data_base + start,
-                data_size,
-            },
-        );
+    if header_bytes.first() != Some(&b'{') {
+        anyhow::bail!("Safetensors header must start with a JSON object");
     }
-
+    let RawHeader(raw) =
+        serde_json::from_slice(&header_bytes).context("Failed to parse safetensors JSON")?;
+    let payload_len = file_len - data_base;
+    let mut tensor_names: Vec<_> = raw.keys().cloned().collect();
+    tensor_names.sort();
+    let mut tensors = HashMap::new();
+    let mut ranges = Vec::new();
+    for (name, raw) in raw {
+        let shape = raw
+            .shape
+            .into_iter()
+            .map(usize::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("Shape exceeds address space for tensor {name}"))?;
+        let [start, end] = raw.data_offsets;
+        let span = end
+            .checked_sub(start)
+            .with_context(|| format!("Reversed data offsets for tensor {name}"))?;
+        if end > payload_len {
+            anyhow::bail!("Tensor {name} extends beyond safetensors payload");
+        }
+        let data_size = usize::try_from(span).context("Tensor size exceeds address space")?;
+        let meta = TensorMeta {
+            dtype: raw.dtype,
+            shape,
+            data_offset: data_base
+                .checked_add(start)
+                .context("Tensor offset overflow")?,
+            data_size,
+        };
+        let elem_size = meta.elem_size();
+        if elem_size == 0 {
+            anyhow::bail!("Unsupported dtype: {} for tensor {name}", meta.dtype);
+        }
+        let elements = checked_elements(&meta.shape)
+            .with_context(|| format!("Tensor {name} shape overflow"))?;
+        let expected = elements
+            .checked_mul(elem_size)
+            .with_context(|| format!("Tensor {name} byte size overflow"))?;
+        if expected != data_size {
+            anyhow::bail!(
+                "Tensor {name} shape/dtype requires {expected} bytes, offsets describe {data_size}"
+            );
+        }
+        ranges.push((start, end, name.clone()));
+        tensors.insert(name, meta);
+    }
+    // The format requires an entirely indexed, non-overlapping data buffer.
+    // Empty tensors are legal; sort them before a nonempty tensor at the same start.
+    ranges.sort_unstable();
+    let mut cursor = 0;
+    for (start, end, name) in ranges {
+        if start != cursor {
+            anyhow::bail!("Tensor {name} overlaps another tensor or leaves a payload gap");
+        }
+        cursor = end;
+    }
+    if cursor != payload_len {
+        anyhow::bail!("Unindexed trailing safetensors payload bytes");
+    }
     Ok(SafeTensorsHeader {
         tensor_names,
-        tensors: tensor_map,
-        header_size: 8 + header_size,
+        tensors,
+        header_size: data_base,
     })
 }
 
-/// Load tensor data from a safetensors file
+fn checked_elements(shape: &[usize]) -> Result<usize> {
+    // Zero-sized dimensions describe an empty tensor, even if other dimensions
+    // would overflow when multiplied before encountering the zero.
+    if shape.contains(&0) {
+        return Ok(0);
+    }
+    shape.iter().try_fold(1usize, |n, &dim| {
+        n.checked_mul(dim).context("Tensor element count overflow")
+    })
+}
+
+/// Load tensor data from a safetensors file using endian-explicit, aligned-independent reads.
 pub fn load_tensor(path: &Path, tensor_name: &str) -> Result<Vec<f32>> {
     let header = parse_safetensors_header(path)?;
-    let meta = header.tensors.get(tensor_name).ok_or_else(|| {
-        anyhow::anyhow!("Tensor '{}' not found in {}", tensor_name, path.display())
-    })?;
+    let meta = header
+        .tensors
+        .get(tensor_name)
+        .ok_or_else(|| anyhow::anyhow!("Tensor '{tensor_name}' not found in {}", path.display()))?;
+    load_tensor_data(path, tensor_name, meta)
+}
 
-    let file = File::open(path).context("Failed to open file")?;
+fn load_tensor_data(path: &Path, name: &str, meta: &TensorMeta) -> Result<Vec<f32>> {
+    let elem_size = meta.elem_size();
+    if elem_size == 0 {
+        anyhow::bail!("Unsupported dtype: {} for tensor {name}", meta.dtype);
+    }
+    let elements = checked_elements(&meta.shape)?;
+    if elements.checked_mul(elem_size) != Some(meta.data_size) {
+        anyhow::bail!("Invalid tensor byte length: {name}");
+    }
+    if !matches!(meta.dtype.as_str(), "F32" | "F16" | "BF16" | "I32" | "I64") {
+        anyhow::bail!(
+            "Unsupported dtype for f32 loading: {} for tensor {name}",
+            meta.dtype
+        );
+    }
+    let file = File::open(path).context("Failed to open tensor data file")?;
+    let file_len = file.metadata()?.len();
+    if meta
+        .data_offset
+        .checked_add(meta.data_size as u64)
+        .is_none_or(|end| end > file_len)
+    {
+        anyhow::bail!("Tensor {name} extends beyond safetensors file");
+    }
     let mut reader = io::BufReader::new(file);
-
-    // Seek to tensor data offset
     reader
         .seek(SeekFrom::Start(meta.data_offset))
         .context("Failed to seek to tensor data")?;
-
-    // Read tensor data
-    let mut data = vec![0u8; meta.data_size];
-    reader
-        .read_exact(&mut data)
-        .context("Failed to read tensor data")?;
-
-    // Convert to f32 based on dtype
-    match meta.dtype.as_str() {
-        "F32" => {
-            let f32_data: &[f32] = bytemuck::cast_slice(&data);
-            Ok(f32_data.to_vec())
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(elements)
+        .context("Unable to allocate tensor output")?;
+    // Avoid retaining a second full-size raw payload alongside the f32 output.
+    let mut bytes = [0u8; 64 * 1024];
+    let mut remaining = meta.data_size;
+    while remaining > 0 {
+        let count = remaining.min(bytes.len());
+        reader
+            .read_exact(&mut bytes[..count])
+            .with_context(|| format!("Failed to read tensor {name}"))?;
+        for chunk in bytes[..count].chunks_exact(elem_size) {
+            let value = match meta.dtype.as_str() {
+                "F32" => f32::from_le_bytes(chunk.try_into()?),
+                "F16" => half::f16::from_bits(u16::from_le_bytes(chunk.try_into()?)).to_f32(),
+                "BF16" => f32::from_bits((u16::from_le_bytes(chunk.try_into()?) as u32) << 16),
+                "I64" => i64::from_le_bytes(chunk.try_into()?) as f32,
+                "I32" => i32::from_le_bytes(chunk.try_into()?) as f32,
+                _ => unreachable!("dtype validated above"),
+            };
+            output.push(value);
         }
-        "F16" => {
-            // Convert FP16 to FP32
-            let f16_data: &[u16] = bytemuck::cast_slice(&data);
-            let f32_data: Vec<f32> = f16_data
-                .iter()
-                .map(|&bits| half::f16::from_bits(bits).to_f32())
-                .collect();
-            Ok(f32_data)
-        }
-        "BF16" => {
-            // BF16 has same bit representation as top 16 bits of FP32
-            let bf16_data: &[u16] = bytemuck::cast_slice(&data);
-            let f32_data: Vec<f32> = bf16_data
-                .iter()
-                .map(|&bits| f32::from_bits((bits as u32) << 16))
-                .collect();
-            Ok(f32_data)
-        }
-        "I32" => {
-            let i32_data: &[i32] = bytemuck::cast_slice(&data);
-            Ok(i32_data.iter().map(|&x| x as f32).collect())
-        }
-        "I64" => {
-            let i64_data: &[i64] = bytemuck::cast_slice(&data);
-            Ok(i64_data.iter().map(|&x| x as f32).collect())
-        }
-        _ => {
-            anyhow::bail!(
-                "Unsupported dtype: {} for tensor {}",
-                meta.dtype,
-                tensor_name
-            );
-        }
+        remaining -= count;
     }
+    Ok(output)
 }
 
 /// List all tensors in a safetensors file
@@ -281,7 +348,9 @@ impl MlxModelLoader {
         let mut header_size = 0u64;
         for path in &weight_paths {
             let header = parse_safetensors_header(path)?;
-            header_size += header.header_size;
+            header_size = header_size
+                .checked_add(header.header_size)
+                .context("Shard header size overflow")?;
             for name in header.tensor_names {
                 if tensors.contains_key(&name) {
                     anyhow::bail!("Duplicate tensor {} across safetensors shards", name);
@@ -303,13 +372,30 @@ impl MlxModelLoader {
             header_size,
         };
 
-        // Try to load config
-        let config = if let Ok(config_str) = std::fs::read_to_string(model_dir.join("config.json"))
-        {
-            MlxModelConfig::from_json(&config_str).ok()
-        } else {
-            None
-        };
+        // Absence is allowed for low-level tensor inspection; present-but-invalid
+        // configuration must not silently turn conversion into an anonymous model.
+        let config_path = model_dir.join("config.json");
+        let config =
+            match File::open(&config_path) {
+                Ok(file) => {
+                    if file.metadata()?.len() > MAX_CONFIG_BYTES {
+                        anyhow::bail!("Model config exceeds {MAX_CONFIG_BYTES} byte budget");
+                    }
+                    let mut bytes = Vec::new();
+                    file.take(MAX_CONFIG_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                        .context("Failed to read model config")?;
+                    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+                        anyhow::bail!("Model config exceeds byte budget");
+                    }
+                    let json = std::str::from_utf8(&bytes).context("Model config is not UTF-8")?;
+                    Some(MlxModelConfig::from_json(json).with_context(|| {
+                        format!("Invalid model config: {}", config_path.display())
+                    })?)
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error).context("Failed to open model config"),
+            };
 
         Ok(MlxModelLoader {
             config,
@@ -344,7 +430,12 @@ impl MlxModelLoader {
             .tensor_files
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Tensor '{}' not found", name))?;
-        load_tensor(path, name)
+        let meta = self
+            .header
+            .tensors
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Missing tensor metadata: {name}"))?;
+        load_tensor_data(path, name, meta)
     }
 
     /// Get all tensor names

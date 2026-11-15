@@ -69,7 +69,7 @@ pub struct InferenceConfig {
     pub batch_size: usize,
     /// KV cache quantization type
     pub kv_quant: KvQuantType,
-    /// Weight quantization format
+    /// Runtime weight storage. Only FP32 is implemented; source GGUF codecs are independent.
     pub weight_format: QuantFormat,
     /// Backend to use
     pub backend: BackendType,
@@ -80,6 +80,8 @@ pub struct InferenceConfig {
     /// Optional cap for eagerly materialized tensor elements.
     /// Set to None to attempt loading all supported tensors.
     pub max_loaded_tensor_elements: Option<usize>,
+    /// Explicitly allow incomplete byte/vocabulary fixtures, never production defaults.
+    pub allow_byte_tokenizer: bool,
 }
 
 impl Default for InferenceConfig {
@@ -88,11 +90,12 @@ impl Default for InferenceConfig {
             max_seq_len: 4096,
             batch_size: 1,
             kv_quant: KvQuantType::TurboQuant3b2b,
-            weight_format: QuantFormat::Q4_K,
+            weight_format: QuantFormat::FP32,
             backend: BackendType::default(),
-            rope_freq_base: 1000000.0,
+            rope_freq_base: 10000.0,
             rms_norm_eps: 1e-5,
-            max_loaded_tensor_elements: Some(10_000_000),
+            max_loaded_tensor_elements: None,
+            allow_byte_tokenizer: false,
         }
     }
 }
@@ -120,6 +123,49 @@ impl Default for GenerationConfig {
             seed: None,
             stop_sequences: Vec::new(),
         }
+    }
+}
+
+/// A single active generation with private KV state and sampling RNG.
+pub struct GenerationSession {
+    pub output: Vec<u32>,
+    pub prompt_len: usize,
+    pub finished: bool,
+    pub finish_reason: &'static str,
+    caches: Vec<KvCache>,
+    logits: Vec<f32>,
+    generation: GenerationConfig,
+    rng: StdRng,
+    eos: Option<u32>,
+    prefill_position: usize,
+}
+
+impl GenerationSession {
+    /// Bytes in this session's allocated KV payload, including packed scales/minima.
+    /// Does not include engine caches, weights, allocator overhead or GPU mirrors.
+    pub fn kv_cache_memory_usage(&self) -> usize {
+        self.caches.iter().map(KvCache::memory_usage).sum()
+    }
+
+    /// Completion tokens that are safe to send without leaking a partial stop string.
+    pub fn visible_output(&self) -> &[u32] {
+        let generated = &self.output[self.prompt_len..];
+        let held = if self.finished {
+            0
+        } else {
+            self.generation
+                .stop_sequences
+                .iter()
+                .map(|stop| {
+                    (1..stop.len().min(generated.len() + 1))
+                        .rev()
+                        .find(|&len| generated.ends_with(&stop[..len]))
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        &generated[..generated.len() - held]
     }
 }
 
@@ -194,20 +240,38 @@ pub struct PackedKvBuffer {
 }
 
 impl PackedKvBuffer {
+    /// Construct a packed physical-slot buffer. Supported widths are 1..=8 bits.
     pub fn new(bits: u32, head_dim: usize, max_seq_len: usize) -> Self {
-        let bytes_per_token = (head_dim * bits as usize).div_ceil(8);
-        PackedKvBuffer {
-            data: vec![0; bytes_per_token * max_seq_len],
-            mins: vec![0.0; max_seq_len],
-            scales: vec![1.0; max_seq_len],
+        Self::try_new(bits, head_dim, max_seq_len).expect("Invalid packed KV buffer configuration")
+    }
+
+    pub fn try_new(bits: u32, head_dim: usize, max_seq_len: usize) -> Result<Self, String> {
+        if !(1..=8).contains(&bits) || head_dim == 0 || max_seq_len == 0 {
+            return Err("Packed KV requires 1..=8 bits, a positive dimension and capacity".into());
+        }
+        let bytes_per_token = head_dim
+            .checked_mul(bits as usize)
+            .ok_or("Packed KV dimension overflow")?
+            .div_ceil(8);
+        let byte_len = bytes_per_token
+            .checked_mul(max_seq_len)
+            .ok_or("Packed KV capacity overflow")?;
+        Ok(Self {
+            data: zeroed_kv_bytes(byte_len)?,
+            mins: zeroed_kv_floats(max_seq_len)?,
+            scales: unit_kv_scales(max_seq_len)?,
             bits,
             head_dim,
             bytes_per_token,
-        }
+        })
     }
 
     pub fn add(&mut self, position: usize, values: &[f32]) {
         assert_eq!(values.len(), self.head_dim, "KV vector dimension mismatch");
+        assert!(
+            position < self.mins.len(),
+            "KV physical position exceeds capacity"
+        );
 
         let levels = (1u32 << self.bits) - 1;
         let min = values.iter().copied().fold(f32::INFINITY, f32::min);
@@ -232,26 +296,21 @@ impl PackedKvBuffer {
     }
 
     pub fn get_all(&self, seq_len: usize) -> Vec<f32> {
+        assert!(seq_len <= self.mins.len(), "KV length exceeds capacity");
         let mut output = vec![0.0; seq_len * self.head_dim];
-        let mask = (1u32 << self.bits) - 1;
-
-        for position in 0..seq_len {
-            let start = position * self.bytes_per_token;
-            let min = self.mins[position];
-            let scale = self.scales[position];
-
-            for dim in 0..self.head_dim {
-                let q = self.read_bits(start, dim) & mask;
-                output[position * self.head_dim + dim] = min + q as f32 * scale;
-            }
+        for (position, row) in output.chunks_exact_mut(self.head_dim).enumerate() {
+            self.decode_range(position, 0, row);
         }
-
         output
     }
 
     pub fn value_at(&self, position: usize, dim: usize) -> f32 {
+        assert!(
+            position < self.mins.len() && dim < self.head_dim,
+            "KV index exceeds dimensions"
+        );
         let start = position * self.bytes_per_token;
-        let q = self.read_bits(start, dim) & ((1u32 << self.bits) - 1);
+        let q = self.read_bits(start, dim);
         self.mins[position] + q as f32 * self.scales[position]
     }
 
@@ -285,31 +344,88 @@ impl PackedKvBuffer {
             + self.scales.len() * std::mem::size_of::<f32>()
     }
 
-    fn write_bits(&mut self, token_start: usize, index: usize, value: u32) {
-        let bit_offset = index * self.bits as usize;
-        for bit in 0..self.bits as usize {
-            if ((value >> bit) & 1) == 0 {
-                continue;
-            }
-            let absolute = token_start * 8 + bit_offset + bit;
-            let byte = absolute / 8;
-            let bit_in_byte = absolute % 8;
-            self.data[byte] |= 1 << bit_in_byte;
+    fn decode_range(&self, position: usize, first_dim: usize, output: &mut [f32]) {
+        let start = position * self.bytes_per_token;
+        let min = self.mins[position];
+        let scale = self.scales[position];
+        for (dim, slot) in output.iter_mut().enumerate() {
+            *slot = min + self.read_bits(start, first_dim + dim) as f32 * scale;
         }
     }
 
-    fn read_bits(&self, token_start: usize, index: usize) -> u32 {
-        let bit_offset = index * self.bits as usize;
-        let mut value = 0u32;
-        for bit in 0..self.bits as usize {
-            let absolute = token_start * 8 + bit_offset + bit;
-            let byte = absolute / 8;
-            let bit_in_byte = absolute % 8;
-            let bit_value = (self.data[byte] >> bit_in_byte) & 1;
-            value |= (bit_value as u32) << bit;
+    // Every field is <=8 bits, so even a byte-straddling field touches at most
+    // two bytes. Rows are cleared by add before OR writes; neighbouring fields
+    // and the final row's unused padding bits are never read as payload.
+    #[inline]
+    fn write_bits(&mut self, token_start: usize, index: usize, value: u32) {
+        let offset = index * self.bits as usize;
+        let byte = token_start + offset / 8;
+        let shift = offset % 8;
+        let packed = (value as u16) << shift;
+        self.data[byte] |= packed as u8;
+        if shift + self.bits as usize > 8 {
+            self.data[byte + 1] |= (packed >> 8) as u8;
         }
-        value
     }
+
+    #[inline]
+    fn read_bits(&self, token_start: usize, index: usize) -> u32 {
+        let offset = index * self.bits as usize;
+        let byte = token_start + offset / 8;
+        let shift = offset % 8;
+        let mut packed = u16::from(self.data[byte]);
+        if shift + self.bits as usize > 8 {
+            packed |= u16::from(self.data[byte + 1]) << 8;
+        }
+        u32::from((packed >> shift) & ((1u16 << self.bits) - 1))
+    }
+}
+
+// Using the global allocator's zeroed allocation preserves demand-zero pages
+// on supporting allocators/operating systems. Reserving then filling a Vec
+// eagerly writes the entire maximum-context cache, even for a short session.
+// Keep these helpers concrete: all-zero bits are valid u8 and positive f32
+// zero, but would not be a valid initialization for an arbitrary Rust type.
+fn zeroed_kv_bytes(length: usize) -> Result<Vec<u8>, String> {
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<u8>(length)
+        .map_err(|error| format!("Invalid KV byte buffer layout: {error}"))?;
+    // SAFETY: length is nonzero, and Layout::array checked the size bound.
+    // alloc_zeroed uses the same global allocator that Vec uses on drop.
+    let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+    if pointer.is_null() {
+        return Err("Cannot allocate zeroed KV byte buffer".into());
+    }
+    // SAFETY: the allocation has exactly the u8 alignment and length capacity;
+    // every element is initialized to a valid zero, and ownership moves to Vec.
+    Ok(unsafe { Vec::from_raw_parts(pointer, length, length) })
+}
+
+fn zeroed_kv_floats(length: usize) -> Result<Vec<f32>, String> {
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<f32>(length)
+        .map_err(|error| format!("Invalid KV float buffer layout: {error}"))?;
+    // SAFETY: length is nonzero, and Layout::array checked both byte-size and
+    // isize bounds. The global allocation is aligned for f32 and Vec-compatible.
+    let pointer = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<f32>();
+    if pointer.is_null() {
+        return Err("Cannot allocate zeroed KV float buffer".into());
+    }
+    // SAFETY: all-zero bits represent initialized +0.0 f32 elements. Layout,
+    // length and capacity match exactly, and Vec takes sole allocation ownership.
+    Ok(unsafe { Vec::from_raw_parts(pointer, length, length) })
+}
+
+fn unit_kv_scales(length: usize) -> Result<Vec<f32>, String> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(length)
+        .map_err(|error| format!("Cannot allocate KV buffer: {error}"))?;
+    data.resize(length, 1.0);
+    Ok(data)
 }
 
 /// KV cache buffer for one key or value stream.
@@ -319,11 +435,23 @@ pub enum KvCacheBuffer {
 }
 
 impl KvCacheBuffer {
-    fn new(bits: u32, head_dim: usize, max_seq_len: usize, quantized: bool) -> Self {
+    fn try_new(
+        bits: u32,
+        head_dim: usize,
+        max_seq_len: usize,
+        quantized: bool,
+    ) -> Result<Self, String> {
         if quantized {
-            KvCacheBuffer::Quantized(PackedKvBuffer::new(bits, head_dim, max_seq_len))
+            Ok(Self::Quantized(PackedKvBuffer::try_new(
+                bits,
+                head_dim,
+                max_seq_len,
+            )?))
         } else {
-            KvCacheBuffer::Float(vec![0.0; max_seq_len * head_dim])
+            let length = head_dim
+                .checked_mul(max_seq_len)
+                .ok_or("KV float capacity overflow")?;
+            Ok(Self::Float(zeroed_kv_floats(length)?))
         }
     }
 
@@ -337,30 +465,24 @@ impl KvCacheBuffer {
         }
     }
 
-    fn get_all(&self, seq_len: usize, head_dim: usize) -> Vec<f32> {
+    // Float caches borrow their row directly; packed caches dequantize only a
+    // single KV head into a scratch vector reused by every corresponding Q head.
+    fn head_slice<'a>(
+        &'a self,
+        position: usize,
+        first_dim: usize,
+        token_dim: usize,
+        scratch: &'a mut [f32],
+    ) -> &'a [f32] {
         match self {
-            KvCacheBuffer::Float(data) => data[..seq_len * head_dim].to_vec(),
-            KvCacheBuffer::Quantized(buffer) => buffer.get_all(seq_len),
-        }
-    }
-
-    fn value_at(&self, position: usize, dim: usize, head_dim: usize) -> f32 {
-        match self {
-            KvCacheBuffer::Float(data) => data[position * head_dim + dim],
-            KvCacheBuffer::Quantized(buffer) => buffer.value_at(position, dim),
-        }
-    }
-
-    fn shift_left(&mut self, seq_len: usize, head_dim: usize) {
-        match self {
-            KvCacheBuffer::Float(data) => {
-                let total = seq_len * head_dim;
-                let skip = head_dim;
-                let src_len = total - skip;
-                data.copy_within(skip..total, 0);
-                data[src_len..total].fill(0.0);
+            Self::Float(data) => {
+                let start = position * token_dim + first_dim;
+                &data[start..start + scratch.len()]
             }
-            KvCacheBuffer::Quantized(buffer) => buffer.shift_left(seq_len),
+            Self::Quantized(buffer) => {
+                buffer.decode_range(position, first_dim, scratch);
+                scratch
+            }
         }
     }
 
@@ -391,46 +513,98 @@ pub struct KvCache {
     pub max_seq_len: usize,
     pub head_dim: usize,
     pub quant_type: KvQuantType,
+    // Physical slot for logical token zero. Insertion only overwrites one slot.
+    start_slot: usize,
 }
 
 impl KvCache {
     pub fn new(head_dim: usize, max_seq_len: usize, quant_type: KvQuantType) -> Self {
+        Self::try_new(head_dim, max_seq_len, quant_type).expect("Invalid KV cache configuration")
+    }
+
+    /// Fallible constructor for public callers handling untrusted dimensions.
+    pub fn try_new(
+        head_dim: usize,
+        max_seq_len: usize,
+        quant_type: KvQuantType,
+    ) -> Result<Self, String> {
+        if head_dim == 0 || max_seq_len == 0 {
+            return Err("KV cache requires a positive dimension and capacity".into());
+        }
         let quantized = quant_type != KvQuantType::None;
-        KvCache {
-            keys: KvCacheBuffer::new(quant_type.key_bits(), head_dim, max_seq_len, quantized),
-            values: KvCacheBuffer::new(quant_type.val_bits(), head_dim, max_seq_len, quantized),
+        Ok(Self {
+            keys: KvCacheBuffer::try_new(quant_type.key_bits(), head_dim, max_seq_len, quantized)?,
+            values: KvCacheBuffer::try_new(
+                quant_type.val_bits(),
+                head_dim,
+                max_seq_len,
+                quantized,
+            )?,
             seq_len: 0,
             max_seq_len,
             head_dim,
             quant_type,
-        }
+            start_slot: 0,
+        })
     }
 
-    /// Add a token to the cache
+    /// Append a physical slot; full caches overwrite the oldest token in O(head_dim).
+    /// This storage primitive does not alter the engine's context or RoPE policy.
     pub fn add(&mut self, key: &[f32], value: &[f32]) {
-        if self.seq_len >= self.max_seq_len {
-            // Shift cache (simple implementation)
-            self.shift();
+        assert_eq!(key.len(), self.head_dim, "KV key dimension mismatch");
+        assert_eq!(value.len(), self.head_dim, "KV value dimension mismatch");
+        assert!(self.seq_len <= self.max_seq_len, "Invalid KV cache length");
+        let full = self.seq_len == self.max_seq_len;
+        let position = if full {
+            self.start_slot
+        } else {
+            self.physical_slot(self.seq_len)
+        };
+        self.keys.add(position, self.head_dim, key);
+        self.values.add(position, self.head_dim, value);
+        if full {
+            self.start_slot = if position + 1 == self.max_seq_len {
+                0
+            } else {
+                position + 1
+            };
+        } else {
+            self.seq_len += 1;
         }
-
-        self.keys.add(self.seq_len, self.head_dim, key);
-        self.values.add(self.seq_len, self.head_dim, value);
-        self.seq_len += 1;
     }
 
-    /// Shift cache by one position (for when cache is full)
-    fn shift(&mut self) {
-        self.keys.shift_left(self.seq_len, self.head_dim);
-        self.values.shift_left(self.seq_len, self.head_dim);
-        self.seq_len -= 1;
+    #[inline]
+    fn physical_slot(&self, logical: usize) -> usize {
+        let tail = self.max_seq_len - self.start_slot;
+        if logical < tail {
+            self.start_slot + logical
+        } else {
+            logical - tail
+        }
     }
 
-    /// Get the full cache content
+    /// Snapshot in oldest-to-newest logical order, independent of physical wraps.
     pub fn get_all(&self) -> (Vec<f32>, Vec<f32>) {
-        (
-            self.keys.get_all(self.seq_len, self.head_dim),
-            self.values.get_all(self.seq_len, self.head_dim),
-        )
+        let mut keys = vec![0.0; self.seq_len * self.head_dim];
+        let mut values = vec![0.0; self.seq_len * self.head_dim];
+        let mut scratch = vec![0.0; self.head_dim];
+        for logical in 0..self.seq_len {
+            let position = self.physical_slot(logical);
+            let start = logical * self.head_dim;
+            keys[start..start + self.head_dim].copy_from_slice(self.keys.head_slice(
+                position,
+                0,
+                self.head_dim,
+                &mut scratch,
+            ));
+            values[start..start + self.head_dim].copy_from_slice(self.values.head_slice(
+                position,
+                0,
+                self.head_dim,
+                &mut scratch,
+            ));
+        }
+        (keys, values)
     }
 
     /// Clear the cache
@@ -438,6 +612,7 @@ impl KvCache {
         self.keys.clear();
         self.values.clear();
         self.seq_len = 0;
+        self.start_slot = 0;
     }
 
     /// Memory usage in bytes
@@ -456,42 +631,89 @@ impl KvCache {
         num_q_heads: usize,
         num_kv_heads: usize,
     ) -> Vec<f32> {
-        let group = (num_q_heads / num_kv_heads).max(1);
+        assert!(
+            query_head_dim > 0 && num_kv_heads > 0 && num_q_heads > 0,
+            "Attention dimensions must be positive"
+        );
+        assert_eq!(
+            num_q_heads % num_kv_heads,
+            0,
+            "Q heads must be divisible by KV heads"
+        );
+        assert_eq!(
+            num_kv_heads.checked_mul(query_head_dim),
+            Some(self.head_dim),
+            "Attention/cache dimensions disagree"
+        );
+        assert_eq!(
+            num_q_heads.checked_mul(query_head_dim),
+            Some(q.len()),
+            "Invalid query shape"
+        );
+        let group = num_q_heads / num_kv_heads;
         let scale = 1.0 / (query_head_dim as f32).sqrt();
-        let mut output = vec![0.0f32; num_q_heads * query_head_dim];
+        let mut output = vec![0.0f32; q.len()];
+        if self.seq_len == 0 {
+            return output;
+        }
+        let score_len = group
+            .checked_mul(self.seq_len)
+            .expect("Attention scratch size overflow");
+        let mut scores = vec![0.0f32; score_len];
+        let mut sums = vec![0.0f32; group];
+        let mut scratch = vec![0.0f32; query_head_dim];
 
-        for qh in 0..num_q_heads {
-            let kvh = (qh / group).min(num_kv_heads - 1);
-            let mut scores = vec![0.0f32; self.seq_len];
-
-            for (token, score_slot) in scores.iter_mut().enumerate().take(self.seq_len) {
-                let mut score = 0.0f32;
-                for d in 0..query_head_dim {
-                    let dim = kvh * query_head_dim + d;
-                    score +=
-                        q[qh * query_head_dim + d] * self.keys.value_at(token, dim, self.head_dim);
+        for kvh in 0..num_kv_heads {
+            let first_dim = kvh * query_head_dim;
+            let first_qh = kvh * group;
+            // Decode each key element once per KV head, not once per query head.
+            for token in 0..self.seq_len {
+                let key = self.keys.head_slice(
+                    self.physical_slot(token),
+                    first_dim,
+                    self.head_dim,
+                    &mut scratch,
+                );
+                for qh in 0..group {
+                    let query =
+                        &q[(first_qh + qh) * query_head_dim..(first_qh + qh + 1) * query_head_dim];
+                    let mut score = 0.0;
+                    for d in 0..query_head_dim {
+                        score += query[d] * key[d];
+                    }
+                    scores[qh * self.seq_len + token] = score * scale;
                 }
-                *score_slot = score * scale;
             }
-
-            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum_exp = 0.0f32;
-            for score in &mut scores {
-                *score = (*score - max_score).exp();
-                sum_exp += *score;
-            }
-            if sum_exp <= 0.0 {
-                continue;
-            }
-
-            for d in 0..query_head_dim {
-                let mut weighted_sum = 0.0f32;
-                let dim = kvh * query_head_dim + d;
-                for (token, score) in scores.iter().enumerate().take(self.seq_len) {
-                    weighted_sum +=
-                        (*score / sum_exp) * self.values.value_at(token, dim, self.head_dim);
+            for (qh, sum_slot) in sums.iter_mut().enumerate() {
+                let row = &mut scores[qh * self.seq_len..(qh + 1) * self.seq_len];
+                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0;
+                for value in row {
+                    *value = (*value - max).exp();
+                    sum += *value;
                 }
-                output[qh * query_head_dim + d] = weighted_sum;
+                *sum_slot = sum;
+            }
+            // Token-major value reads retain ascending-token accumulation for each
+            // output coordinate, preserving the previous F32 summation order.
+            for token in 0..self.seq_len {
+                let value = self.values.head_slice(
+                    self.physical_slot(token),
+                    first_dim,
+                    self.head_dim,
+                    &mut scratch,
+                );
+                for (qh, &sum) in sums.iter().enumerate() {
+                    if sum <= 0.0 {
+                        continue;
+                    }
+                    let weight = scores[qh * self.seq_len + token] / sum;
+                    let row = &mut output
+                        [(first_qh + qh) * query_head_dim..(first_qh + qh + 1) * query_head_dim];
+                    for d in 0..query_head_dim {
+                        row[d] += weight * value[d];
+                    }
+                }
             }
         }
 
@@ -502,6 +724,7 @@ impl KvCache {
 /// Main inference engine
 pub struct InferenceEngine {
     pub model: Option<ModelWeights>,
+    pub tokenizer: Option<crate::tokenizer::RuntimeTokenizer>,
     pub kv_caches: Vec<KvCache>,
     pub config: InferenceConfig,
     pub backend: Box<dyn Backend>,
@@ -522,6 +745,7 @@ impl InferenceEngine {
 
         InferenceEngine {
             model: None,
+            tokenizer: None,
             kv_caches: Vec::new(),
             config,
             backend,
@@ -539,79 +763,150 @@ impl InferenceEngine {
     pub fn load_model<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let model_path = path.as_ref();
 
+        if self.config.weight_format != QuantFormat::FP32 {
+            return Err(io::Error::new(io::ErrorKind::Unsupported,
+                "Only F32 runtime weight storage is implemented; GGUF source quantization is detected separately"));
+        }
+        if let Some(reason) = self.backend.failure_reason() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, reason));
+        }
         // Parse GGUF header and tensor metadata with mmap-backed parser.
         let metadata = GgufReader::parse_file(model_path)?;
 
-        // Determine architecture
-        let arch_str: String = metadata.architecture().unwrap_or("unknown").to_string();
+        let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
+        let arch_str = metadata.architecture().unwrap_or("unknown").to_string();
         let arch = ModelArch::from_str(&arch_str);
-
-        // Extract model parameters
-        let num_layers = metadata.num_layers().unwrap_or(32);
-        let hidden_size = metadata.hidden_size().unwrap_or(4096);
-        let ff_dim = metadata.feed_forward_size().unwrap_or(11008);
-        let num_heads = metadata.num_attention_heads().unwrap_or(32);
-        let num_kv_heads = metadata.num_key_value_heads().unwrap_or(num_heads);
-        let vocab_size = metadata.vocab_size().unwrap_or(32000);
-        let rope_freq_base = metadata.rope_freq_base();
-        let head_dim = hidden_size / num_heads;
-
-        // Update config from metadata
-        let mut config = self.config.clone();
-        config.max_seq_len = metadata.context_length().unwrap_or(4096);
-        config.rope_freq_base = rope_freq_base;
-
-        // Create quant engine
-        let weight_format = self
-            .detect_weight_quant(&metadata)
-            .unwrap_or(QuantFormat::Q4_K);
-        config.weight_format = weight_format;
-        let mut quant_engine = QuantEngine::new(weight_format, config.kv_quant);
-
-        // Generate rotation matrices for TurboQuant
-        quant_engine.generate_rotations(head_dim, num_layers);
-
-        // Create memory pool
-        let memory = UnifiedMemory::new();
-
-        // Allocate paged KV cache accounting in the unified memory pool.
-        let kv_bytes_per_dim = if config.kv_quant == KvQuantType::None {
-            std::mem::size_of::<f32>() * 2
-        } else {
-            ((config.kv_quant.key_bits() + config.kv_quant.val_bits()) as usize).div_ceil(8)
-                + std::mem::size_of::<f32>() * 2
+        if arch != ModelArch::Llama {
+            return Err(invalid(format!(
+                "Unsupported inference architecture: {arch_str}; only llama is implemented"
+            )));
+        }
+        if !matches!(
+            self.config.backend,
+            BackendType::CpuSimd | BackendType::Cuda
+        ) || !self.backend.is_available()
+        {
+            return Err(invalid(format!(
+                "{} inference kernels are not implemented; use cpu-simd",
+                self.config.backend.name()
+            )));
+        }
+        let required = |key: &str| {
+            metadata
+                .get_usize(key)
+                .ok_or_else(|| invalid(format!("Missing model dimension: {key}")))
         };
-
-        let mut kv_caches = Vec::with_capacity(num_layers);
-        for layer in 0..num_layers {
-            let _ = memory.allocate_kv_cache(
-                layer,
-                config.max_seq_len,
-                num_kv_heads * head_dim,
-                kv_bytes_per_dim,
-            );
-            kv_caches.push(KvCache::new(
-                num_kv_heads * head_dim,
-                config.max_seq_len,
-                config.kv_quant,
+        let num_layers = required("llama.block_count")?;
+        let hidden_size = required("llama.embedding_length")?;
+        let ff_dim = required("llama.feed_forward_length")?;
+        let num_heads = required("llama.attention.head_count")?;
+        let num_kv_heads = metadata.num_key_value_heads().unwrap_or(num_heads);
+        let model_context = required("llama.context_length")?;
+        if hidden_size == 0
+            || ff_dim == 0
+            || num_heads == 0
+            || num_kv_heads == 0
+            || model_context == 0
+            || self.config.max_seq_len == 0
+            || hidden_size % num_heads != 0
+            || num_heads % num_kv_heads != 0
+        {
+            return Err(invalid("Invalid model dimensions or context length".into()));
+        }
+        if metadata
+            .get_usize("llama.expert_count")
+            .is_some_and(|n| n > 0)
+            || metadata
+                .get_usize("llama.expert_used_count")
+                .is_some_and(|n| n > 0)
+            || metadata
+                .get_usize("llama.attention.sliding_window")
+                .is_some_and(|n| n > 0)
+            || metadata
+                .tensors
+                .iter()
+                .any(|tensor| tensor.name.ends_with(".bias"))
+        {
+            return Err(invalid(
+                "MoE, sliding-window and bias-bearing LLaMA graphs are not implemented".into(),
             ));
         }
-
-        // Read supported tensor data from GGUF (we store dequantized weights).
+        let head_dim = hidden_size / num_heads;
+        for key in [
+            "llama.attention.key_length",
+            "llama.attention.value_length",
+            "llama.rope.dimension_count",
+        ] {
+            if metadata.metadata.contains_key(key) && metadata.get_usize(key) != Some(head_dim) {
+                return Err(invalid(format!(
+                    "Unsupported or invalid head dimension: {key}"
+                )));
+            }
+        }
+        if head_dim % 2 != 0 || metadata.rope_dim().is_some_and(|dim| dim != head_dim) {
+            return Err(invalid(
+                "Only full, even-sized RoPE head dimensions are supported".into(),
+            ));
+        }
+        if metadata
+            .tensors
+            .iter()
+            .any(|tensor| tensor.name == "rope_freqs.weight")
+            || metadata.metadata.iter().any(|(key, value)| {
+                key == "llama.rope.scale_linear"
+                    || key == "llama.rope.scale"
+                    || (key.starts_with("llama.rope.scaling.")
+                        && !(key == "llama.rope.scaling.type" && value.as_str() == Some("none")))
+            })
+        {
+            return Err(invalid(
+                "Scaled RoPE and rope_freqs.weight are not implemented".into(),
+            ));
+        }
+        let mut config = self.config.clone();
+        config.max_seq_len = config.max_seq_len.min(model_context);
+        let parameter = |key: &str, default: f32| -> io::Result<f32> {
+            match metadata.metadata.get(key) {
+                None => Ok(default),
+                Some(value) => value
+                    .as_f32()
+                    .ok_or_else(|| invalid(format!("Invalid floating model parameter: {key}"))),
+            }
+        };
+        config.rope_freq_base = parameter("llama.rope.freq_base", 10000.0)?;
+        config.rms_norm_eps = parameter(
+            "llama.attention.layer_norm_rms_epsilon",
+            config.rms_norm_eps,
+        )?;
+        if !config.rope_freq_base.is_finite()
+            || config.rope_freq_base <= 0.0
+            || !config.rms_norm_eps.is_finite()
+            || config.rms_norm_eps <= 0.0
+        {
+            return Err(invalid("Invalid RoPE frequency or RMSNorm epsilon".into()));
+        }
+        // Validate dimensions and all required weights before allocating any KV caches.
         let mut tensors = HashMap::new();
-        let mut skipped_tensors = 0usize;
         for tensor_info in &metadata.tensors {
-            let elements = tensor_info.num_elements();
+            let elements = tensor_info
+                .shape
+                .iter()
+                .try_fold(1usize, |total, &dim| {
+                    usize::try_from(dim)
+                        .ok()
+                        .and_then(|dim| total.checked_mul(dim))
+                })
+                .ok_or_else(|| {
+                    invalid(format!("Tensor dimension overflow: {}", tensor_info.name))
+                })?;
             if elements == 0
                 || config
                     .max_loaded_tensor_elements
                     .is_some_and(|limit| elements > limit)
             {
-                skipped_tensors += 1;
                 continue;
             }
-
-            let supported = matches!(
+            if !matches!(
                 tensor_info.data_type,
                 GgufDataType::F32
                     | GgufDataType::F16
@@ -620,47 +915,127 @@ impl InferenceEngine {
                     | GgufDataType::Q4_0
                     | GgufDataType::Q4_K
                     | GgufDataType::Q2_K
-            );
-            if !supported {
-                skipped_tensors += 1;
-                tracing::debug!(
-                    "Skipping tensor with unsupported dequantization: {} ({})",
-                    tensor_info.name,
-                    tensor_info.data_type
-                );
+            ) {
                 continue;
             }
-
-            tracing::info!(
-                "Loading tensor: {} ({} elements, {}, offset={})",
-                tensor_info.name,
-                elements,
-                tensor_info.data_type,
-                metadata.absolute_tensor_offset(tensor_info)
-            );
-
-            match GgufReader::read_tensor_f32(model_path, &metadata, tensor_info) {
-                Ok(data) => {
-                    tensors.insert(tensor_info.name.clone(), data);
-                }
-                Err(e) => {
-                    skipped_tensors += 1;
-                    tracing::warn!(
-                        "Failed to load tensor {} ({}): {}",
-                        tensor_info.name,
-                        tensor_info.data_type,
-                        e
-                    );
-                }
+            let data = GgufReader::read_tensor_f32(model_path, &metadata, tensor_info)?;
+            if data.len() != elements || data.iter().any(|value| !value.is_finite()) {
+                return Err(invalid(format!(
+                    "Invalid tensor data: {}",
+                    tensor_info.name
+                )));
+            }
+            if tensors.insert(tensor_info.name.clone(), data).is_some() {
+                return Err(invalid(format!("Duplicate tensor: {}", tensor_info.name)));
             }
         }
-        if skipped_tensors > 0 {
-            tracing::info!(
-                "Skipped {} tensors that are too large or not yet supported",
-                skipped_tensors
-            );
+        // Resolve aliases against the FILE, not only successfully loaded tensors.
+        // A present unsupported output head must never silently become tied embeddings.
+        let find = |names: &[String]| -> io::Result<&Vec<f32>> {
+            let name = names
+                .iter()
+                .find(|name| metadata.get_tensor(name).is_some())
+                .ok_or_else(|| {
+                    invalid(format!("Missing required tensor: {}", names.join(" or ")))
+                })?;
+            tensors.get(name).ok_or_else(|| {
+                invalid(format!(
+                    "Unsupported, capped or empty required tensor: {name}"
+                ))
+            })
+        };
+        let embedding_names = Self::embedding_names();
+        let embedding = find(&embedding_names)
+            .map_err(|err| invalid(format!("Invalid token embedding: {err}")))?;
+        if embedding.len() % hidden_size != 0 || embedding.is_empty() {
+            return Err(invalid("Invalid token embedding shape".into()));
         }
+        let vocab_size = embedding.len() / hidden_size;
+        if vocab_size > u32::MAX as usize
+            || metadata.vocab_size().is_some_and(|size| size != vocab_size)
+        {
+            return Err(invalid(
+                "Vocabulary and embedding dimensions disagree".into(),
+            ));
+        }
+        let check = |names: Vec<String>, rows: usize, cols: usize| -> io::Result<()> {
+            let expected = rows
+                .checked_mul(cols)
+                .ok_or_else(|| invalid("Tensor shape overflow".into()))?;
+            let tensor = find(&names)?;
+            let info = names
+                .iter()
+                .find_map(|name| metadata.get_tensor(name))
+                .ok_or_else(|| invalid("Required tensor metadata is missing".into()))?;
+            let expected_shape = if rows == 1 && info.shape.len() == 1 {
+                vec![cols as u64]
+            } else {
+                vec![cols as u64, rows as u64]
+            };
+            if tensor.len() != expected || info.shape != expected_shape {
+                return Err(invalid(format!(
+                    "Invalid shape for {}: expected {expected} elements, got {}",
+                    names[0],
+                    tensor.len()
+                )));
+            }
+            Ok(())
+        };
+        check(embedding_names, vocab_size, hidden_size)?;
+        check(Self::output_norm_names(), 1, hidden_size)?;
+        check(Self::output_head_names(), vocab_size, hidden_size)?;
+        for layer in 0..num_layers {
+            for role in ["attn_norm", "ffn_norm"] {
+                check(Self::layer_tensor_names(layer, role), 1, hidden_size)?;
+            }
+            for role in ["attn_q", "attn_output"] {
+                check(
+                    Self::layer_tensor_names(layer, role),
+                    hidden_size,
+                    hidden_size,
+                )?;
+            }
+            for role in ["attn_k", "attn_v"] {
+                check(
+                    Self::layer_tensor_names(layer, role),
+                    num_kv_heads * head_dim,
+                    hidden_size,
+                )?;
+            }
+            for role in ["ffn_gate", "ffn_up"] {
+                check(Self::layer_tensor_names(layer, role), ff_dim, hidden_size)?;
+            }
+            check(
+                Self::layer_tensor_names(layer, "ffn_down"),
+                hidden_size,
+                ff_dim,
+            )?;
+        }
+        // Source tensor codec is a file property; execution materializes every
+        // supported tensor as F32. Do not turn it into a fake runtime override.
+        config.weight_format = QuantFormat::FP32;
+        let quant_engine = QuantEngine::new(QuantFormat::FP32, config.kv_quant);
+        let memory = UnifiedMemory::new();
+        let kv_dim = num_kv_heads * head_dim;
+        kv_dim
+            .checked_mul(config.max_seq_len)
+            .and_then(|n| n.checked_mul(8))
+            .and_then(|n| n.checked_mul(num_layers))
+            .ok_or_else(|| invalid("KV cache size overflow".into()))?;
+        let kv_caches = (0..num_layers)
+            .map(|_| KvCache::new(kv_dim, config.max_seq_len, config.kv_quant))
+            .collect();
 
+        let tokenizer = crate::tokenizer::RuntimeTokenizer::from_model(
+            model_path,
+            &metadata,
+            vocab_size,
+            config.allow_byte_tokenizer,
+        )
+        .map_err(io::Error::other)?;
+        self.backend
+            .prepare_weights(&tensors)
+            .map_err(io::Error::other)?;
         // Store model
         self.model = Some(ModelWeights {
             metadata,
@@ -670,6 +1045,7 @@ impl InferenceEngine {
             memory,
         });
 
+        self.tokenizer = Some(tokenizer);
         self.kv_caches = kv_caches;
         self.config = config;
         self.vocab_size = vocab_size;
@@ -691,31 +1067,15 @@ impl InferenceEngine {
         Ok(())
     }
 
-    /// Detect weight quantization format from metadata
-    fn detect_weight_quant(&self, metadata: &ModelMetadata) -> Option<QuantFormat> {
-        // Try to detect from tensor data types
-        for tensor in &metadata.tensors {
-            match tensor.data_type {
-                GgufDataType::F32 => return Some(QuantFormat::FP32),
-                GgufDataType::F16 | GgufDataType::BF16 => return Some(QuantFormat::FP16),
-                GgufDataType::Q4_0 => return Some(QuantFormat::Q4_0),
-                GgufDataType::Q4_1 => return Some(QuantFormat::Q4_1),
-                GgufDataType::Q4_K => return Some(QuantFormat::Q4_K),
-                GgufDataType::Q5_0 => return Some(QuantFormat::Q5_0),
-                GgufDataType::Q5_1 => return Some(QuantFormat::Q5_1),
-                GgufDataType::Q5_K => return Some(QuantFormat::Q5_K),
-                GgufDataType::Q6_K => return Some(QuantFormat::Q6_K),
-                GgufDataType::Q8_0 => return Some(QuantFormat::Q8_0),
-                GgufDataType::Q8_K => return Some(QuantFormat::Q8_K),
-                GgufDataType::Q2_K => return Some(QuantFormat::Q2_K),
-                GgufDataType::Q3_K => return Some(QuantFormat::Q3_K),
-                _ => {}
-            }
-        }
-        None
-    }
-
     fn tensor<'a>(model: &'a ModelWeights, names: &[String]) -> Result<&'a Vec<f32>, String> {
+        if let Some(name) = names
+            .iter()
+            .find(|name| model.metadata.get_tensor(name).is_some())
+        {
+            return model
+                .get_tensor(name)
+                .ok_or_else(|| format!("Missing tensor: {name}"));
+        }
         for name in names {
             if let Some(tensor) = model.get_tensor(name) {
                 return Ok(tensor);
@@ -826,12 +1186,15 @@ impl InferenceEngine {
             return 0;
         }
 
-        if config.temperature <= 0.0 {
+        let penalty = config.repetition_penalty;
+        if config.temperature <= 0.0 && penalty == 1.0 {
             return Self::greedy_token(logits);
         }
-
-        let seen: HashSet<u32> = output.iter().copied().collect();
-        let penalty = config.repetition_penalty.max(1.0);
+        let seen: HashSet<u32> = if penalty == 1.0 {
+            HashSet::new()
+        } else {
+            output.iter().copied().collect()
+        };
         let temperature = config.temperature.max(1e-5);
         let mut candidates: Vec<(usize, f32)> = logits
             .iter()
@@ -839,14 +1202,14 @@ impl InferenceEngine {
             .enumerate()
             .filter(|(_, value)| value.is_finite())
             .map(|(idx, mut logit)| {
-                if penalty > 1.0 && seen.contains(&(idx as u32)) {
+                if penalty != 1.0 && seen.contains(&(idx as u32)) {
                     if logit >= 0.0 {
                         logit /= penalty;
                     } else {
                         logit *= penalty;
                     }
                 }
-                (idx, logit / temperature)
+                (idx, logit)
             })
             .collect();
 
@@ -854,6 +1217,13 @@ impl InferenceEngine {
             return 0;
         }
 
+        if config.temperature <= 0.0 {
+            return candidates
+                .iter()
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(id, _)| *id as u32)
+                .unwrap_or(0);
+        }
         candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
         if config.top_k > 0 && candidates.len() > config.top_k {
             candidates.truncate(config.top_k);
@@ -862,7 +1232,7 @@ impl InferenceEngine {
         let max_logit = candidates[0].1;
         let mut probs: Vec<(usize, f32)> = candidates
             .into_iter()
-            .map(|(idx, logit)| (idx, (logit - max_logit).exp()))
+            .map(|(idx, logit)| (idx, ((logit - max_logit) / temperature).exp()))
             .collect();
         let sum: f32 = probs.iter().map(|(_, prob)| *prob).sum();
         if sum <= 0.0 {
@@ -892,6 +1262,7 @@ impl InferenceEngine {
             }
         }
 
+        let fallback = probs[0].0 as u32;
         let mut draw = rng.gen::<f32>();
         for (idx, prob) in probs {
             if draw <= prob {
@@ -899,7 +1270,7 @@ impl InferenceEngine {
             }
             draw -= prob;
         }
-        Self::greedy_token(logits)
+        fallback
     }
 
     fn matched_stop_len(
@@ -1030,66 +1401,54 @@ impl InferenceEngine {
     }
 
     fn transformer_logits(&self, model: &ModelWeights, hidden: &[f32]) -> Result<Vec<f32>, String> {
-        let default_weight = vec![1.0f32; self.hidden_size];
-        let norm_weight =
-            Self::tensor(model, &Self::output_norm_names()).unwrap_or(&default_weight);
+        let norm_weight = Self::tensor(model, &Self::output_norm_names())?;
         let hidden = kernel::rms_norm(hidden, norm_weight, self.config.rms_norm_eps);
-
-        if let Ok(output) = Self::tensor(model, &Self::output_head_names()) {
-            let rows = output.len() / self.hidden_size;
-            return Self::matvec(output, rows, self.hidden_size, &hidden);
-        }
-
-        Ok(hidden)
+        let output = Self::tensor(model, &Self::output_head_names())?;
+        self.backend
+            .matvec(output, self.vocab_size, self.hidden_size, &hidden)
     }
 
-    /// Run a single stateless forward pass. This is kept for tests and callers
-    /// that only need a smoke-test decode without mutating KV cache.
+    /// Stateless forward pass through the same validated transformer as generation.
     pub fn decode(&self, token: u32, position: usize) -> Result<Vec<f32>, String> {
-        let model = self.model.as_ref().ok_or("Model not loaded")?;
-
-        // Get embedding for this token
-        let mut hidden = if let Ok(embedding) = Self::tensor(model, &Self::embedding_names()) {
-            let rows = (embedding.len() / self.hidden_size).max(1);
-            let start = (token as usize % rows) * self.hidden_size;
-            let end = start + self.hidden_size;
-            embedding[start..end.min(embedding.len())].to_vec()
-        } else {
-            // Large GGUF embeddings are not materialized in the smoke-test loader;
-            // synthesize a deterministic embedding so the pipeline can be tested.
-            (0..self.hidden_size)
-                .map(|i| ((token as usize + i) % 1024) as f32 / 1024.0 - 0.5)
-                .collect()
-        };
-
-        if hidden.len() < self.hidden_size {
-            hidden.resize(self.hidden_size, 0.0);
-        }
-
-        // Apply RMS norm (simplified - in real model this is per-layer)
-        let default_weight = vec![1.0f32; self.hidden_size];
-        let rms_weight = model.get_tensor("norm.weight").unwrap_or(&default_weight);
-
-        hidden = kernel::rms_norm(&hidden, rms_weight, self.config.rms_norm_eps);
-
-        // Apply RoPE
-        kernel::rope_single(
-            &mut hidden,
-            position,
-            self.head_dim,
-            self.config.rope_freq_base,
-        );
-
-        Ok(hidden)
+        let mut caches = self.new_kv_caches();
+        self.decode_into(token, position, &mut caches)
     }
 
     /// Run a single autoregressive decode step through loaded transformer layers.
     pub fn decode_with_cache(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
-        let model = self.model.as_ref().ok_or("Model not loaded")?;
+        let mut caches = std::mem::take(&mut self.kv_caches);
+        let result = self.decode_into(token, position, &mut caches);
+        self.kv_caches = caches;
+        result
+    }
 
+    fn new_kv_caches(&self) -> Vec<KvCache> {
+        (0..self.num_layers)
+            .map(|_| {
+                KvCache::new(
+                    self.num_kv_heads * self.head_dim,
+                    self.config.max_seq_len,
+                    self.config.kv_quant,
+                )
+            })
+            .collect()
+    }
+
+    fn decode_into(
+        &self,
+        token: u32,
+        position: usize,
+        caches: &mut [KvCache],
+    ) -> Result<Vec<f32>, String> {
+        let model = self.model.as_ref().ok_or("Model not loaded")?;
+        if self.hidden_size == 0 || token as usize >= self.vocab_size {
+            return Err(format!("Token {token} is outside the model vocabulary"));
+        }
+        if position >= self.config.max_seq_len {
+            return Err("Context length exceeded".into());
+        }
         let embedding = Self::tensor(model, &Self::embedding_names())?;
-        let vocab_rows = (embedding.len() / self.hidden_size).max(1);
-        let start = (token as usize % vocab_rows) * self.hidden_size;
+        let start = token as usize * self.hidden_size;
         let end = start + self.hidden_size;
         if end > embedding.len() {
             return Err("Token embedding tensor has an invalid shape".to_string());
@@ -1105,25 +1464,30 @@ impl InferenceEngine {
             let o_weight = Self::tensor(model, &Self::layer_tensor_names(layer, "attn_output"))?;
 
             let normed = kernel::rms_norm(&hidden, attn_norm, self.config.rms_norm_eps);
-            let mut q = Self::matvec(
+            let mut q = self.backend.matvec(
                 q_weight,
                 self.num_heads * self.head_dim,
                 self.hidden_size,
                 &normed,
             )?;
-            let mut k = Self::matvec(k_weight, kv_dim, self.hidden_size, &normed)?;
-            let v = Self::matvec(v_weight, kv_dim, self.hidden_size, &normed)?;
+            let mut k = self
+                .backend
+                .matvec(k_weight, kv_dim, self.hidden_size, &normed)?;
+            let v = self
+                .backend
+                .matvec(v_weight, kv_dim, self.hidden_size, &normed)?;
 
             Self::apply_rope_heads(&mut q, position, self.head_dim, self.config.rope_freq_base);
             Self::apply_rope_heads(&mut k, position, self.head_dim, self.config.rope_freq_base);
 
-            let cache = self
-                .kv_caches
+            let cache = caches
                 .get_mut(layer)
                 .ok_or_else(|| format!("Missing KV cache for layer {}", layer))?;
             cache.add(&k, &v);
             let attn = cache.attention_decode(&q, self.head_dim, self.num_heads, self.num_kv_heads);
-            let attn_out = Self::matvec(o_weight, self.hidden_size, self.hidden_size, &attn)?;
+            let attn_out =
+                self.backend
+                    .matvec(o_weight, self.hidden_size, self.hidden_size, &attn)?;
             Self::add_inplace(&mut hidden, &attn_out);
 
             let ffn_norm = Self::tensor(model, &Self::layer_tensor_names(layer, "ffn_norm"))?;
@@ -1132,13 +1496,19 @@ impl InferenceEngine {
             let down_weight = Self::tensor(model, &Self::layer_tensor_names(layer, "ffn_down"))?;
 
             let normed = kernel::rms_norm(&hidden, ffn_norm, self.config.rms_norm_eps);
-            let gate = Self::matvec(gate_weight, self.ff_dim, self.hidden_size, &normed)?;
-            let up = Self::matvec(up_weight, self.ff_dim, self.hidden_size, &normed)?;
+            let gate = self
+                .backend
+                .matvec(gate_weight, self.ff_dim, self.hidden_size, &normed)?;
+            let up = self
+                .backend
+                .matvec(up_weight, self.ff_dim, self.hidden_size, &normed)?;
             let mut gated = vec![0.0f32; self.ff_dim];
             for i in 0..self.ff_dim {
                 gated[i] = (gate[i] / (1.0 + (-gate[i]).exp())) * up[i];
             }
-            let ffn_out = Self::matvec(down_weight, self.hidden_size, self.ff_dim, &gated)?;
+            let ffn_out =
+                self.backend
+                    .matvec(down_weight, self.hidden_size, self.ff_dim, &gated)?;
             Self::add_inplace(&mut hidden, &ffn_out);
         }
 
@@ -1148,22 +1518,18 @@ impl InferenceEngine {
     /// Run a batch of tokens through the model (prefill)
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
         if tokens.is_empty() {
-            return Ok(vec![]);
+            return Err("Prompt must contain at least one token".into());
         }
-
+        if tokens.len() > self.config.max_seq_len {
+            return Err("Prompt exceeds context length".into());
+        }
         for cache in &mut self.kv_caches {
             cache.clear();
         }
 
         let mut logits = Vec::new();
         for (position, &token) in tokens.iter().enumerate() {
-            logits = match self.decode_with_cache(token, position) {
-                Ok(logits) => logits,
-                Err(err) => {
-                    tracing::debug!("Falling back to stateless decode during prefill: {}", err);
-                    self.decode(token, position)?
-                }
-            };
+            logits = self.decode_with_cache(token, position)?;
         }
 
         Ok(logits)
@@ -1202,39 +1568,134 @@ impl InferenceEngine {
     where
         F: FnMut(u32, &[u32]) -> Result<(), String>,
     {
-        let mut output = prompt.to_vec();
-
-        let mut logits = self.prefill(prompt)?;
-        let mut rng = StdRng::seed_from_u64(generation.seed.unwrap_or(0x5eed_5eed));
-
-        // Autoregressive decode
-        for _ in 0..generation.max_tokens {
-            let next_token = Self::sample_token(&logits, &output, generation, &mut rng);
-
-            output.push(next_token);
-            if let Some(stop_len) =
-                Self::matched_stop_len(&output, prompt.len(), &generation.stop_sequences)
-            {
-                let new_len = output.len().saturating_sub(stop_len);
-                output.truncate(new_len);
-                break;
+        let mut session = self.start_session(prompt, generation)?;
+        let mut emitted = 0;
+        while !session.finished {
+            self.step_session(&mut session)?;
+            let visible_len = session.visible_output().len();
+            for i in emitted..visible_len {
+                let end = session.prompt_len + i + 1;
+                on_token(session.output[end - 1], &session.output[..end])?;
             }
-            on_token(next_token, &output)?;
-
-            let position = output.len() - 1;
-            logits = match self.decode_with_cache(next_token, position) {
-                Ok(logits) => logits,
-                Err(err) => {
-                    tracing::debug!(
-                        "Falling back to stateless decode during generation: {}",
-                        err
-                    );
-                    self.decode(next_token, position)?
-                }
-            };
+            emitted = visible_len;
         }
+        Ok(session.output)
+    }
 
-        Ok(output)
+    /// Prepare an independent sequence, sharing weights but owning its KV cache and RNG.
+    pub fn start_session(
+        &mut self,
+        prompt: &[u32],
+        generation: &GenerationConfig,
+    ) -> Result<GenerationSession, String> {
+        if self.model.is_none() {
+            return Err("Model not loaded".into());
+        }
+        if prompt.is_empty() {
+            return Err("Prompt must contain at least one token".into());
+        }
+        if prompt
+            .len()
+            .checked_add(generation.max_tokens)
+            .is_none_or(|n| n > self.config.max_seq_len)
+        {
+            return Err("Prompt and max_tokens exceed context length".into());
+        }
+        if !generation.temperature.is_finite()
+            || generation.temperature < 0.0
+            || !generation.top_p.is_finite()
+            || generation.top_p <= 0.0
+            || generation.top_p > 1.0
+            || !generation.repetition_penalty.is_finite()
+            || generation.repetition_penalty <= 0.0
+        {
+            return Err("Invalid sampling parameters".into());
+        }
+        if let Some(token) = prompt.iter().find(|&&token| {
+            token as usize >= self.vocab_size
+                || self.tokenizer.as_ref().is_some_and(|t| !t.valid_id(token))
+        }) {
+            return Err(format!("Token {token} is outside the model vocabulary"));
+        }
+        // A zero-token request returns its prompt without allocating a full KV cache.
+        let caches = if generation.max_tokens == 0 {
+            Vec::new()
+        } else {
+            self.new_kv_caches()
+        };
+        let logits = Vec::new();
+        let eos = self
+            .model
+            .as_ref()
+            .and_then(|m| m.metadata.get_usize("tokenizer.ggml.eos_token_id"))
+            .and_then(|id| u32::try_from(id).ok());
+        Ok(GenerationSession {
+            output: prompt.to_vec(),
+            prompt_len: prompt.len(),
+            finished: generation.max_tokens == 0,
+            finish_reason: "length",
+            caches,
+            logits,
+            generation: generation.clone(),
+            eos,
+            prefill_position: 0,
+            rng: generation
+                .seed
+                .map(StdRng::seed_from_u64)
+                .unwrap_or_else(StdRng::from_entropy),
+        })
+    }
+
+    /// Advance one prefill or generation token. `None` with `finished == false`
+    /// means that prefill advanced; callers should continue scheduling the session.
+    pub fn step_session(&mut self, session: &mut GenerationSession) -> Result<Option<u32>, String> {
+        if session.finished {
+            return Ok(None);
+        }
+        if session.prefill_position < session.prompt_len {
+            let position = session.prefill_position;
+            session.logits =
+                self.decode_into(session.output[position], position, &mut session.caches)?;
+            session.prefill_position += 1;
+            return Ok(None);
+        }
+        if let Some(tokenizer) = &self.tokenizer {
+            tokenizer.mask_logits(&mut session.logits);
+        }
+        if session.logits.len() != self.vocab_size || !session.logits.iter().any(|v| v.is_finite())
+        {
+            return Err("Model returned invalid logits".into());
+        }
+        let token = Self::sample_token(
+            &session.logits,
+            &session.output,
+            &session.generation,
+            &mut session.rng,
+        );
+        if Some(token) == session.eos || self.tokenizer.as_ref().is_some_and(|t| t.is_eog(token)) {
+            session.finished = true;
+            session.finish_reason = "stop";
+            return Ok(None);
+        }
+        session.output.push(token);
+        if let Some(len) = Self::matched_stop_len(
+            &session.output,
+            session.prompt_len,
+            &session.generation.stop_sequences,
+        ) {
+            session.output.truncate(session.output.len() - len);
+            session.finished = true;
+            session.finish_reason = "stop";
+            return Ok(None);
+        }
+        if session.output.len() - session.prompt_len >= session.generation.max_tokens {
+            session.finished = true;
+            session.finish_reason = "length";
+        } else {
+            session.logits =
+                self.decode_into(token, session.output.len() - 1, &mut session.caches)?;
+        }
+        Ok(Some(token))
     }
 
     /// Generate text with external draft tokens verified against the target model.
@@ -1247,50 +1708,22 @@ impl InferenceEngine {
         generation: &GenerationConfig,
         draft_tokens: &[u32],
     ) -> Result<(Vec<u32>, SpeculativeStats), String> {
-        let mut output = prompt.to_vec();
-        let mut logits = self.prefill(prompt)?;
-        let mut rng = StdRng::seed_from_u64(generation.seed.unwrap_or(0x5eed_5eed));
-        let mut draft_index = 0usize;
+        let mut session = self.start_session(prompt, generation)?;
         let mut stats = SpeculativeStats::default();
-
-        for _ in 0..generation.max_tokens {
-            let verified = Self::sample_token(&logits, &output, generation, &mut rng);
-            let next_token = if let Some(&drafted) = draft_tokens.get(draft_index) {
-                draft_index += 1;
-                if drafted == verified {
-                    stats.accepted += 1;
-                    drafted
-                } else {
-                    stats.rejected += 1;
-                    verified
+        let mut index = 0;
+        while !session.finished {
+            if let Some(token) = self.step_session(&mut session)? {
+                if let Some(&draft) = draft_tokens.get(index) {
+                    if token == draft {
+                        stats.accepted += 1;
+                    } else {
+                        stats.rejected += 1;
+                    }
                 }
-            } else {
-                verified
-            };
-
-            output.push(next_token);
-            if let Some(stop_len) =
-                Self::matched_stop_len(&output, prompt.len(), &generation.stop_sequences)
-            {
-                let new_len = output.len().saturating_sub(stop_len);
-                output.truncate(new_len);
-                break;
+                index += 1;
             }
-
-            let position = output.len() - 1;
-            logits = match self.decode_with_cache(next_token, position) {
-                Ok(logits) => logits,
-                Err(err) => {
-                    tracing::debug!(
-                        "Falling back to stateless decode during speculative generation: {}",
-                        err
-                    );
-                    self.decode(next_token, position)?
-                }
-            };
         }
-
-        Ok((output, stats))
+        Ok((session.output, stats))
     }
 
     /// Run speculative decoding with a separate draft engine.
@@ -1301,41 +1734,58 @@ impl InferenceEngine {
         generation: &GenerationConfig,
         draft_window: usize,
     ) -> Result<(Vec<u32>, SpeculativeStats), String> {
-        let mut output = prompt.to_vec();
+        let mut target = self.start_session(prompt, generation)?;
+        while !target.finished && target.prefill_position < target.prompt_len {
+            self.step_session(&mut target)?;
+        }
         let mut stats = SpeculativeStats::default();
-        let window = draft_window.max(1);
-
-        while output.len().saturating_sub(prompt.len()) < generation.max_tokens {
+        while !target.finished {
             let remaining = generation
                 .max_tokens
-                .saturating_sub(output.len().saturating_sub(prompt.len()));
-            let draft_generation = GenerationConfig {
-                max_tokens: remaining.min(window),
-                ..generation.clone()
-            };
-            let proposed = draft.generate_with_config(&output, &draft_generation)?;
-            let draft_tokens = proposed[output.len().min(proposed.len())..].to_vec();
-
-            let verify_generation = GenerationConfig {
-                max_tokens: draft_tokens.len().max(1).min(remaining),
-                ..generation.clone()
-            };
-            let before_len = output.len();
-            let (verified, step_stats) =
-                self.generate_with_draft_tokens(&output, &verify_generation, &draft_tokens)?;
-            output = verified;
-            stats.accepted += step_stats.accepted;
-            stats.rejected += step_stats.rejected;
-
-            if output.len() == before_len {
-                break;
-            }
-            if Self::matched_stop_len(&output, prompt.len(), &generation.stop_sequences).is_some() {
-                break;
+                .saturating_sub(target.output.len() - target.prompt_len);
+            let proposed = draft.generate_with_config(
+                &target.output,
+                &GenerationConfig {
+                    max_tokens: remaining.min(draft_window.max(1)),
+                    ..generation.clone()
+                },
+            )?;
+            let drafts = &proposed[target.output.len()..];
+            for index in 0..drafts.len().max(1) {
+                if target.finished {
+                    break;
+                }
+                if let Some(token) = self.step_session(&mut target)? {
+                    if let Some(&candidate) = drafts.get(index) {
+                        if token == candidate {
+                            stats.accepted += 1;
+                        } else {
+                            stats.rejected += 1;
+                        }
+                    }
+                }
             }
         }
+        Ok((target.output, stats))
+    }
 
-        Ok((output, stats))
+    /// Actual materialized F32 weight payload, irrespective of source quantization.
+    pub fn weight_memory_usage(&self) -> usize {
+        self.model
+            .as_ref()
+            .map(|model| {
+                model
+                    .tensors
+                    .values()
+                    .map(|tensor| tensor.len() * std::mem::size_of::<f32>())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Payload owned by the engine's standalone decode caches, excluding sessions.
+    pub fn kv_cache_memory_usage(&self) -> usize {
+        self.kv_caches.iter().map(KvCache::memory_usage).sum()
     }
 
     /// Get model info as a summary string
@@ -1355,18 +1805,30 @@ impl InferenceEngine {
             )
         }).unwrap_or_else(|| "No model loaded".to_string());
 
-        let kv_mem = self
-            .kv_caches
-            .iter()
-            .map(|kv| kv.memory_usage())
-            .sum::<usize>();
+        let kv_mem = self.kv_cache_memory_usage();
 
+        let source_formats = self
+            .model
+            .as_ref()
+            .map(|model| {
+                model
+                    .metadata
+                    .tensors
+                    .iter()
+                    .map(|tensor| tensor.data_type.to_string())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "none".into());
         format!(
-            "{}\n\nBackend: {}\nKV Quant: {}\nWeight Quant: {}\nMax seq len: {}\nKV cache memory: {}",
+            "{}\n\nBackend: {}\nKV Quant: {}\nSource tensor encodings: {}\nRuntime weight storage: F32\nWeight payload memory: {}\nMax seq len: {}\nKV cache memory: {}",
             model,
             self.backend.name(),
             self.config.kv_quant.name(),
-            self.config.weight_format.name(),
+            source_formats,
+            crate::memory::format_size(self.weight_memory_usage()),
             self.config.max_seq_len,
             crate::memory::format_size(kv_mem),
         )
@@ -1377,6 +1839,34 @@ impl InferenceEngine {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn zeroed_kv_allocations_initialize_all_elements_and_allow_vec_growth() {
+        for length in [0, 1, 31, 4097] {
+            let mut bytes = zeroed_kv_bytes(length).unwrap();
+            assert_eq!(bytes.len(), length);
+            assert!(bytes.iter().all(|&value| value == 0));
+            bytes.fill(0xa5);
+            bytes.push(0x3c);
+            assert!(bytes[..length].iter().all(|&value| value == 0xa5));
+            assert_eq!(bytes[length], 0x3c);
+
+            let mut floats = zeroed_kv_floats(length).unwrap();
+            assert_eq!(floats.len(), length);
+            assert!(floats.iter().all(|value| value.to_bits() == 0));
+            floats.fill(1.25);
+            floats.push(-2.5);
+            assert!(floats[..length].iter().all(|&value| value == 1.25));
+            assert_eq!(floats[length], -2.5);
+        }
+    }
+
+    #[test]
+    fn zeroed_kv_allocations_reject_invalid_layouts_before_allocating() {
+        assert!(zeroed_kv_bytes(isize::MAX as usize + 1).is_err());
+        assert!(zeroed_kv_floats(isize::MAX as usize / size_of::<f32>() + 1).is_err());
+        assert!(zeroed_kv_floats(usize::MAX).is_err());
+    }
 
     fn identity(rows: usize, cols: usize) -> Vec<f32> {
         let mut weight = vec![0.0; rows * cols];

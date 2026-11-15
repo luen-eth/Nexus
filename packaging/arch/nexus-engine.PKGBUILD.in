@@ -1,0 +1,17 @@
+# Native Arch ELF payload; do not repackage these binaries as Debian engines.
+# Rebuild here with: SOURCE_DATE_EPOCH=@EPOCH@ makepkg --nodeps --nocheck
+pkgname=@ENGINE_PACKAGE@
+pkgver=@VERSION@
+pkgrel=@RELEASE@
+pkgdesc='Nexus GGUF inference engine and converter (@ENGINE_FLAVOR@ build for Arch Linux)'
+arch=('x86_64')
+url='https://github.com/luen-eth/Nexus'
+license=('Apache-2.0')
+depends=(@ENGINE_DEPENDENCIES@)
+@ENGINE_VARIANT_METADATA@
+source=('nexus-engine-rootfs.tar.gz')
+sha256sums=('@PAYLOAD_SHA256@')
+options=('!strip' '!debug')
+package() {
+  cp -a "$srcdir/rootfs/." "$pkgdir/"
+}

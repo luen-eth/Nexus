@@ -10,3 +10,16 @@
 # Build artifacts
 target/
 models/
+
+# Small deterministic GGML blocks are source fixtures, not model weights.
+!tests/fixtures/format/*.bin
+
+# Local audit reports, machine-specific logs and generated packages.
+/docs/reviews/
+/dist/
+/packaging/arch/pkg/
+/packaging/arch/src/
+__pycache__/
+*.py[cod]
+*.pkg.tar.*
+*.deb

@@ -4,13 +4,13 @@
 #![allow(non_camel_case_types)]
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use nexus::gguf::GgufReader;
+use nexus::gguf::{GgufDataType, GgufReader};
 use nexus::mlx::MlxModelLoader;
 use nexus::quant::{KvQuantType, QuantEngine, QuantFormat as NexusQuantFormat};
 
@@ -115,9 +115,8 @@ fn main() -> Result<()> {
             cli.input.display()
         )
     })?;
-    let quant_format = cli.quant.to_nexus_quant()?;
-    let gguf_type = cli.quant.gguf_type()?;
-    let quant_engine = QuantEngine::new(quant_format, KvQuantType::None);
+    validate_model_config(&loader)?;
+    let requested_format = cli.quant.to_nexus_quant()?;
 
     let mut tensors = Vec::new();
     let mut names = HashSet::new();
@@ -139,6 +138,7 @@ fn main() -> Result<()> {
             );
         }
 
+        let values = permute_llama_qk(name, &meta.shape, values, loader.config.as_ref())?;
         let canonical_name = canonical_tensor_name(name);
         if !names.insert(canonical_name.clone()) {
             anyhow::bail!(
@@ -148,8 +148,11 @@ fn main() -> Result<()> {
             );
         }
 
-        let data = quant_engine.quantize_weights(&values);
-        let reconstructed = quant_engine.dequantize(&data, values.len());
+        let format = tensor_quant_format(&meta.shape, requested_format);
+        let quant_engine = QuantEngine::new(format, KvQuantType::None);
+        let gguf_type = weight_data_type(format)?.id();
+        let data = quant_engine.quantize_weights(&values)?;
+        let reconstructed = quant_engine.dequantize(&data, values.len())?;
         if reconstructed.len() != values.len() {
             anyhow::bail!(
                 "Tensor {} quantization roundtrip length mismatch: got {}, expected {}",
@@ -168,7 +171,9 @@ fn main() -> Result<()> {
             data,
             offset,
         });
-        offset += aligned_size as u64;
+        offset = offset
+            .checked_add(aligned_size as u64)
+            .context("Converted tensor offsets overflow")?;
     }
 
     let metadata = build_metadata(&loader, &cli.input, cli.turboquant)?;
@@ -185,6 +190,158 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// The current runtime and HF transforms are implemented for dense LLaMA only.
+fn validate_model_config(loader: &MlxModelLoader) -> Result<()> {
+    let config = loader
+        .config
+        .as_ref()
+        .context("A valid config.json is required for model conversion")?;
+    if config.model_type.as_deref() != Some("llama") {
+        anyhow::bail!(
+            "Unsupported model architecture {:?}; only dense llama conversion is implemented",
+            config.model_type
+        );
+    }
+    for (name, value) in [
+        ("hidden_size", config.hidden_size),
+        ("num_hidden_layers", config.num_hidden_layers),
+        ("num_attention_heads", config.num_attention_heads),
+        ("num_key_value_heads", config.num_key_value_heads),
+        ("intermediate_size", config.intermediate_size),
+        ("vocab_size", config.vocab_size),
+        ("max_position_embeddings", config.max_position_embeddings),
+    ] {
+        if value.is_some_and(|n| n > u32::MAX as usize) {
+            anyhow::bail!("{name} exceeds GGUF U32 metadata range");
+        }
+    }
+    let hidden = config
+        .hidden_size
+        .filter(|n| *n > 0)
+        .context("Missing/zero hidden_size")?;
+    let heads = config
+        .num_attention_heads
+        .filter(|n| *n > 0)
+        .context("Missing/zero num_attention_heads")?;
+    let kv = config.num_key_value_heads.unwrap_or(heads);
+    config
+        .num_hidden_layers
+        .context("Missing num_hidden_layers")?;
+    config
+        .intermediate_size
+        .filter(|n| *n > 0)
+        .context("Missing/zero intermediate_size")?;
+    config
+        .vocab_size
+        .filter(|n| *n > 0)
+        .context("Missing/zero vocab_size")?;
+    config
+        .max_position_embeddings
+        .filter(|n| *n > 0)
+        .context("Missing/zero max_position_embeddings")?;
+    if kv == 0
+        || !hidden.is_multiple_of(heads)
+        || !heads.is_multiple_of(kv)
+        || !(hidden / heads).is_multiple_of(2)
+    {
+        anyhow::bail!("Invalid LLaMA attention dimensions");
+    }
+    if config.rope_theta.is_some_and(|v| !v.is_finite() || v <= 0.)
+        || config
+            .rms_norm_eps
+            .is_some_and(|v| !v.is_finite() || v <= 0.)
+    {
+        anyhow::bail!("Invalid LLaMA rope_theta/rms_norm_eps");
+    }
+    Ok(())
+}
+
+fn weight_data_type(format: NexusQuantFormat) -> Result<GgufDataType> {
+    Ok(match format {
+        NexusQuantFormat::FP32 => GgufDataType::F32,
+        NexusQuantFormat::FP16 => GgufDataType::F16,
+        NexusQuantFormat::Q8_0 => GgufDataType::Q8_0,
+        NexusQuantFormat::Q4_0 => GgufDataType::Q4_0,
+        NexusQuantFormat::Q4_K => GgufDataType::Q4_K,
+        NexusQuantFormat::Q2_K => GgufDataType::Q2_K,
+        other => anyhow::bail!("Unsupported standard weight codec {other}"),
+    })
+}
+
+/// Quantize matrices only when each row fits complete codec blocks; preserve norms/biases.
+fn tensor_quant_format(shape: &[usize], requested: NexusQuantFormat) -> NexusQuantFormat {
+    let ty = match weight_data_type(requested) {
+        Ok(ty) => ty,
+        Err(_) => return requested,
+    };
+    let (block, _) = ty.block_layout();
+    if block > 1
+        && (shape.len() < 2
+            || shape
+                .last()
+                .is_none_or(|n| *n == 0 || !n.is_multiple_of(block)))
+    {
+        NexusQuantFormat::FP32
+    } else {
+        requested
+    }
+}
+
+struct PendingOutput(PathBuf);
+impl Drop for PendingOutput {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Convert HF split-half Q/K row order to LLaMA GGUF adjacent-pair RoPE order.
+fn permute_llama_qk(
+    name: &str,
+    shape: &[usize],
+    values: Vec<f32>,
+    config: Option<&nexus::mlx::MlxModelConfig>,
+) -> Result<Vec<f32>> {
+    let is_q = name.ends_with(".q_proj.weight");
+    let is_k = name.ends_with(".k_proj.weight");
+    if !is_q && !is_k {
+        return Ok(values);
+    }
+    let config = config.context("Q/K conversion requires model config")?;
+    if config.model_type.as_deref() != Some("llama") {
+        return Ok(values);
+    }
+    let heads = config
+        .num_attention_heads
+        .context("Missing num_attention_heads")?;
+    let hidden = config.hidden_size.context("Missing hidden_size")?;
+    let kv_heads = config.num_key_value_heads.unwrap_or(heads);
+    if heads == 0
+        || hidden == 0
+        || !hidden.is_multiple_of(heads)
+        || kv_heads == 0
+        || heads % kv_heads != 0
+    {
+        anyhow::bail!("Invalid LLaMA head dimensions");
+    }
+    let dim = hidden / heads;
+    let rows_heads = if is_q { heads } else { kv_heads };
+    if dim % 2 != 0 || shape.len() != 2 || shape[0] != rows_heads * dim || shape[1] != hidden {
+        anyhow::bail!("Invalid LLaMA Q/K shape for {name}: {shape:?}");
+    }
+    let cols = shape[1];
+    let mut output = vec![0.; values.len()];
+    for head in 0..rows_heads {
+        for pair in 0..dim / 2 {
+            for half in 0..2 {
+                let src = (head * dim + half * (dim / 2) + pair) * cols;
+                let dst = (head * dim + pair * 2 + half) * cols;
+                output[dst..dst + cols].copy_from_slice(&values[src..src + cols]);
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn canonical_tensor_name(name: &str) -> String {
@@ -232,15 +389,9 @@ impl QuantFormat {
         }
     }
 
+    #[cfg(test)]
     fn gguf_type(self) -> Result<u32> {
-        match self {
-            QuantFormat::F32 => Ok(0),
-            QuantFormat::F16 => Ok(1),
-            QuantFormat::Q4_0 => Ok(2),
-            QuantFormat::Q8_0 => Ok(8),
-            QuantFormat::Q2_K => Ok(10),
-            QuantFormat::Q4_K => Ok(12),
-        }
+        Ok(weight_data_type(self.to_nexus_quant()?)?.id())
     }
 }
 
@@ -249,6 +400,7 @@ fn build_metadata(
     input: &Path,
     turboquant: bool,
 ) -> Result<HashMap<String, GgufValue>> {
+    validate_model_config(loader)?;
     let mut metadata = HashMap::new();
     metadata.insert(
         "general.alignment".to_string(),
@@ -347,8 +499,23 @@ fn write_gguf(
     metadata: &HashMap<String, GgufValue>,
     tensors: &[ConvertedTensor],
 ) -> Result<()> {
-    let file =
-        File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .context("GGUF output needs a filename")?
+        .to_string_lossy();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let pending = PendingOutput(parent.join(format!(".{name}.{}.{nonce}.tmp", std::process::id())));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending.0)
+        .with_context(|| format!("Failed to create staged GGUF {}", pending.0.display()))?;
     let mut writer = BufWriter::new(file);
 
     writer.write_all(b"GGUF")?;
@@ -366,7 +533,8 @@ fn write_gguf(
     for tensor in tensors {
         write_string(&mut writer, &tensor.name)?;
         write_u32(&mut writer, tensor.shape.len() as u32)?;
-        for dim in &tensor.shape {
+        // Safetensors dimensions are [rows, columns]; GGUF stores columns first.
+        for dim in tensor.shape.iter().rev() {
             write_u64(&mut writer, *dim as u64)?;
         }
         write_u32(&mut writer, tensor.gguf_type)?;
@@ -379,6 +547,11 @@ fn write_gguf(
         pad_to_alignment(&mut writer, ALIGNMENT)?;
     }
     writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+    validate_written_gguf(&pending.0, tensors.len())?;
+    std::fs::rename(&pending.0, path)
+        .with_context(|| format!("Failed to publish {}", path.display()))?;
     Ok(())
 }
 
@@ -458,6 +631,23 @@ fn insert_tokenizer_metadata(
             .with_context(|| format!("Failed to read {}", tokenizer_path.display()))?,
     )
     .with_context(|| format!("Failed to parse {}", tokenizer_path.display()))?;
+    metadata.insert(
+        "nexus.tokenizer.json".into(),
+        GgufValue::String(std::fs::read_to_string(&tokenizer_path)?),
+    );
+    for (filename, key) in [
+        ("tokenizer_config.json", "nexus.tokenizer.config"),
+        ("generation_config.json", "nexus.generation.config"),
+        ("config.json", "nexus.model.config"),
+    ] {
+        let path = input.join(filename);
+        if path.exists() {
+            metadata.insert(
+                key.into(),
+                GgufValue::String(std::fs::read_to_string(path)?),
+            );
+        }
+    }
     let model = tokenizer
         .get("model")
         .and_then(serde_json::Value::as_object)
@@ -465,7 +655,7 @@ fn insert_tokenizer_metadata(
 
     if let Some(model_type) = model.get("type").and_then(serde_json::Value::as_str) {
         metadata.insert(
-            "tokenizer.ggml.model".to_string(),
+            "nexus.tokenizer.model".to_string(),
             GgufValue::String(model_type.to_ascii_lowercase()),
         );
     }
@@ -657,20 +847,26 @@ fn insert_tokenizer_config_metadata(
     token_to_id: &HashMap<String, u32>,
 ) -> Result<()> {
     let config_path = input.join("tokenizer_config.json");
-    if !config_path.exists() {
-        return Ok(());
-    }
-
-    let config: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&config_path)
-            .with_context(|| format!("Failed to read {}", config_path.display()))?,
-    )
-    .with_context(|| format!("Failed to parse {}", config_path.display()))?;
-
-    if let Some(template) = config
-        .get("chat_template")
-        .and_then(serde_json::Value::as_str)
-    {
+    let config: serde_json::Value = if config_path.exists() {
+        serde_json::from_slice(&std::fs::read(&config_path)?)
+            .with_context(|| format!("Failed to parse {}", config_path.display()))?
+    } else {
+        serde_json::Value::Null
+    };
+    let template = if input.join("chat_template.jinja").exists() {
+        Some(std::fs::read_to_string(input.join("chat_template.jinja"))?)
+    } else if input.join("chat_template.json").exists() {
+        let value = serde_json::from_slice(&std::fs::read(input.join("chat_template.json"))?)?;
+        nexus::tokenizer::exact::select_chat_template(&value).map_err(anyhow::Error::msg)?
+    } else {
+        nexus::tokenizer::exact::select_chat_template(
+            config
+                .get("chat_template")
+                .unwrap_or(&serde_json::Value::Null),
+        )
+        .map_err(anyhow::Error::msg)?
+    };
+    if let Some(template) = template {
         metadata.insert(
             "tokenizer.chat_template".to_string(),
             GgufValue::String(template.to_string()),
@@ -819,15 +1015,15 @@ mod tests {
         );
 
         let loader = MlxModelLoader::new(&dir).unwrap();
-        let engine = QuantEngine::new(NexusQuantFormat::Q8_0, KvQuantType::None);
+        let engine = QuantEngine::new(NexusQuantFormat::FP32, KvQuantType::None);
         let name = loader.tensor_names()[0].clone();
         let meta = loader.tensor_meta(&name).unwrap();
         let values = loader.load_tensor(&name).unwrap();
         let tensors = vec![ConvertedTensor {
             name: canonical_tensor_name(&name),
             shape: meta.shape.clone(),
-            gguf_type: QuantFormat::Q8_0.gguf_type().unwrap(),
-            data: engine.quantize_weights(&values),
+            gguf_type: QuantFormat::F32.gguf_type().unwrap(),
+            data: engine.quantize_weights(&values).unwrap(),
             offset: 0,
         }];
         let metadata = build_metadata(&loader, &dir, false).unwrap();
@@ -841,9 +1037,43 @@ mod tests {
                 .unwrap()
                 .data_type
                 .name(),
-            "Q8_0"
+            "F32"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_template_files_and_named_defaults_survive_conversion() {
+        let dir = std::env::temp_dir().join(format!("nexus-chat-template-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut metadata = HashMap::new();
+        for value in [
+            r#"{"chat_template":"json-template"}"#,
+            r#"{"default":"json-template","tool_use":"wrong"}"#,
+        ] {
+            fs::write(dir.join("chat_template.json"), value).unwrap();
+            insert_tokenizer_config_metadata(&mut metadata, &dir, &HashMap::new()).unwrap();
+            assert!(
+                matches!(metadata.get("tokenizer.chat_template"),Some(GgufValue::String(s)) if s=="json-template")
+            );
+        }
+        fs::write(dir.join("chat_template.jinja"), "jinja-template").unwrap();
+        insert_tokenizer_config_metadata(&mut metadata, &dir, &HashMap::new()).unwrap();
+        assert!(
+            matches!(metadata.get("tokenizer.chat_template"),Some(GgufValue::String(s)) if s=="jinja-template")
+        );
+        fs::remove_file(dir.join("chat_template.jinja")).unwrap();
+        fs::remove_file(dir.join("chat_template.json")).unwrap();
+        fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template":[{"name":"default","template":"config-template"}]}"#,
+        )
+        .unwrap();
+        insert_tokenizer_config_metadata(&mut metadata, &dir, &HashMap::new()).unwrap();
+        assert!(
+            matches!(metadata.get("tokenizer.chat_template"),Some(GgufValue::String(s)) if s=="config-template")
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -922,5 +1152,136 @@ mod tests {
             NexusQuantFormat::Q2_K
         );
         assert_eq!(QuantFormat::Q2_K.gguf_type().unwrap(), 10);
+    }
+    #[test]
+    fn llama_qk_permutation_interleaves_hf_split_halves_per_head() {
+        let config = nexus::mlx::MlxModelConfig::from_json(r#"{"model_type":"llama","hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1}"#).unwrap();
+        let q: Vec<f32> = (0..8).flat_map(|row| vec![row as f32; 8]).collect();
+        let k: Vec<f32> = (0..4).flat_map(|row| vec![row as f32; 8]).collect();
+        let q = permute_llama_qk(
+            "model.layers.0.self_attn.q_proj.weight",
+            &[8, 8],
+            q,
+            Some(&config),
+        )
+        .unwrap();
+        let k = permute_llama_qk(
+            "model.layers.0.self_attn.k_proj.weight",
+            &[4, 8],
+            k,
+            Some(&config),
+        )
+        .unwrap();
+        assert_eq!(
+            q.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|row| row[0])
+                .collect::<Vec<_>>(),
+            vec![0., 2., 1., 3., 4., 6., 5., 7.]
+        );
+        assert_eq!(
+            k.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|row| row[0])
+                .collect::<Vec<_>>(),
+            vec![0., 2., 1., 3.]
+        );
+    }
+
+    #[test]
+    fn gguf_tensor_dimensions_reverse_safetensors_order() {
+        let file = tempfile_for_dimension_test();
+        let tensor = ConvertedTensor {
+            name: "token_embd.weight".into(),
+            shape: vec![3, 8],
+            gguf_type: 0,
+            data: vec![0; 3 * 8 * 4],
+            offset: 0,
+        };
+        write_gguf(&file, &HashMap::new(), &[tensor]).unwrap();
+        let metadata = GgufReader::parse_file(&file).unwrap();
+        assert_eq!(metadata.tensors[0].shape, vec![8, 3]);
+        std::fs::remove_file(file).unwrap();
+    }
+
+    fn tempfile_for_dimension_test() -> PathBuf {
+        std::env::temp_dir().join(format!("nexus-dim-test-{}.gguf", std::process::id()))
+    }
+    #[test]
+    fn quantization_preserves_vectors_and_incomplete_rows() {
+        for (shape, requested, expected) in [
+            (vec![256], NexusQuantFormat::Q4_K, NexusQuantFormat::FP32),
+            (vec![2, 16], NexusQuantFormat::Q4_0, NexusQuantFormat::FP32),
+            (vec![2, 33], NexusQuantFormat::Q8_0, NexusQuantFormat::FP32),
+            (vec![2, 32], NexusQuantFormat::Q4_0, NexusQuantFormat::Q4_0),
+            (vec![2, 256], NexusQuantFormat::Q4_K, NexusQuantFormat::Q4_K),
+            (vec![2, 256], NexusQuantFormat::Q2_K, NexusQuantFormat::Q2_K),
+        ] {
+            assert_eq!(tensor_quant_format(&shape, requested), expected);
+        }
+    }
+
+    #[test]
+    fn invalid_conversion_does_not_replace_existing_output() {
+        let dir = std::env::temp_dir().join(format!(
+            "nexus-atomic-format-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("model.gguf");
+        fs::write(&output, b"previous valid output").unwrap();
+        let invalid = ConvertedTensor {
+            name: "w".into(),
+            shape: vec![31],
+            gguf_type: 2,
+            data: vec![0; 18],
+            offset: 0,
+        };
+        assert!(write_gguf(&output, &HashMap::new(), &[invalid]).is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"previous valid output");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let valid = ConvertedTensor {
+            name: "w".into(),
+            shape: vec![2, 3],
+            gguf_type: 0,
+            data: (0..6).flat_map(|i| (i as f32).to_le_bytes()).collect(),
+            offset: 0,
+        };
+        write_gguf(&output, &HashMap::new(), &[valid]).unwrap();
+        assert_eq!(
+            GgufReader::parse_file(&output).unwrap().tensors[0].shape,
+            [3, 2]
+        );
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_or_unimplemented_architecture_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("nexus-format-config-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        write_f32_safetensors(
+            &dir.join("model.safetensors"),
+            "model.embed_tokens.weight",
+            &[1, 2],
+            &[1., 2.],
+        );
+        for config in [
+            r#"{}"#,
+            r#"{"model_type":"qwen2","hidden_size":2}"#,
+            r#"{"model_type":"llama","hidden_size":0}"#,
+        ] {
+            fs::write(dir.join("config.json"), config).unwrap();
+            let loader = MlxModelLoader::new(&dir).unwrap();
+            assert!(validate_model_config(&loader).is_err());
+            assert!(build_metadata(&loader, &dir, false).is_err());
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 }

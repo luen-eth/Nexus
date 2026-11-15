@@ -4,6 +4,8 @@
 use std::sync::Arc;
 
 pub mod cpu;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod metal;
 
 /// Supported backend types
@@ -60,14 +62,8 @@ impl Default for BackendType {
 impl BackendType {
     /// Auto-detect the best available backend
     pub fn detect() -> Self {
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-        {
-            BackendType::Metal
-        }
-        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-        {
-            BackendType::CpuSimd
-        }
+        // GPU device probing does not imply an implemented inference backend.
+        BackendType::CpuSimd
     }
 }
 
@@ -88,14 +84,53 @@ pub trait Backend: Send + Sync {
     /// Get backend capabilities.
     fn capabilities(&self) -> BackendCapabilities;
 
-    /// Execute a kernel operation
-    fn execute(&self, op: &KernelOp);
+    fn prepare_weights(
+        &self,
+        _tensors: &std::collections::HashMap<String, Vec<f32>>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Dense F32 projection. Backends must return errors rather than discard results.
+    fn matvec(
+        &self,
+        weight: &[f32],
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        if cols == 0
+            || rows == 0
+            || input.len() != cols
+            || rows.checked_mul(cols) != Some(weight.len())
+        {
+            return Err("Invalid matvec dimensions".into());
+        }
+        Ok(weight
+            .chunks_exact(cols)
+            .map(|row| row.iter().zip(input).map(|(w, x)| w * x).sum())
+            .take(rows)
+            .collect())
+    }
+    fn kernel_launches(&self) -> u64 {
+        0
+    }
+    fn resident_weight_bytes(&self) -> u64 {
+        0
+    }
+    fn failure_reason(&self) -> Option<String> {
+        None
+    }
+
+    /// Execute an operation and return its owned result. Unsupported operations
+    /// must return an error; backend selection never implies a CPU fallback.
+    fn execute(&self, op: &KernelOp) -> Result<KernelOutput, String>;
 
     /// Synchronize the backend (wait for all operations to complete)
     fn synchronize(&self);
 }
 
-/// GPU/CPU memory information
+/// GPU/CPU memory information. A zero total means the measurement is unknown.
 #[derive(Debug, Clone)]
 pub struct MemoryInfo {
     pub total_memory: usize,
@@ -113,26 +148,33 @@ impl MemoryInfo {
     }
 }
 
+/// Owned result of a backend operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KernelOutput {
+    F32(Vec<f32>),
+    U8(Vec<u8>),
+}
+
 /// Kernel operation descriptor
 #[derive(Debug, Clone)]
 pub enum KernelOp {
-    /// Matrix multiplication: C = A @ B^T
+    /// Row-major matrix multiplication: A[m,k] @ B[k,n] -> C[m,n]
     MatMul {
         a: Arc<[f32]>,
         b: Arc<[f32]>,
         m: usize,
         n: usize,
         k: usize,
-        output: Arc<Vec<f32>>,
     },
-    /// Attention: scaled dot-product attention
+    /// Single-query scaled dot-product attention. Q is one vector of length D;
+    /// K/V are token-major [tokens,D]. Mask is an optional additive value per
+    /// KV token; negative infinity excludes a token. All-masked output is zero.
     Attention {
         q: Arc<[f32]>,
         k: Arc<[f32]>,
         v: Arc<[f32]>,
         scale: f32,
         mask: Option<Arc<[f32]>>,
-        output: Arc<Vec<f32>>,
     },
     /// Layer normalization
     LayerNorm {
@@ -140,46 +182,77 @@ pub enum KernelOp {
         weight: Arc<[f32]>,
         bias: Option<Arc<[f32]>>,
         eps: f32,
-        output: Arc<Vec<f32>>,
     },
     /// RMS normalization (used in modern LLMs)
     RmsNorm {
         input: Arc<[f32]>,
         weight: Arc<[f32]>,
         eps: f32,
-        output: Arc<Vec<f32>>,
     },
     /// Element-wise add
-    Add {
-        a: Arc<[f32]>,
-        b: Arc<[f32]>,
-        output: Arc<Vec<f32>>,
-    },
+    Add { a: Arc<[f32]>, b: Arc<[f32]> },
     /// Element-wise multiply
-    Mul {
-        a: Arc<[f32]>,
-        b: Arc<[f32]>,
-        output: Arc<Vec<f32>>,
-    },
-    /// Softmax
-    Softmax {
-        input: Arc<[f32]>,
-        dim: usize,
-        output: Arc<Vec<f32>>,
-    },
+    Mul { a: Arc<[f32]>, b: Arc<[f32]> },
+    /// Softmax over each row of the last dimension (row width = dim).
+    Softmax { input: Arc<[f32]>, dim: usize },
     /// Quantize data
     Quantize {
         input: Arc<[f32]>,
         format: crate::quant::QuantFormat,
-        output: Arc<Vec<u8>>,
     },
     /// Dequantize data
     Dequantize {
         input: Arc<[u8]>,
         format: crate::quant::QuantFormat,
         output_len: usize,
-        output: Arc<Vec<f32>>,
     },
+}
+
+struct UnavailableBackend {
+    kind: BackendType,
+    reason: String,
+}
+impl Backend for UnavailableBackend {
+    fn name(&self) -> &str {
+        self.kind.name()
+    }
+    fn backend_type(&self) -> BackendType {
+        self.kind
+    }
+    fn is_available(&self) -> bool {
+        false
+    }
+    fn memory_info(&self) -> MemoryInfo {
+        MemoryInfo {
+            total_memory: 0,
+            free_memory: 0,
+            used_memory: 0,
+        }
+    }
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend: self.kind,
+            available: false,
+            features: vec![],
+            supported_ops: vec![],
+        }
+    }
+    fn failure_reason(&self) -> Option<String> {
+        Some(self.reason.clone())
+    }
+    fn prepare_weights(
+        &self,
+        _: &std::collections::HashMap<String, Vec<f32>>,
+    ) -> Result<(), String> {
+        Err(self.reason.clone())
+    }
+    fn matvec(&self, _: &[f32], _: usize, _: usize, _: &[f32]) -> Result<Vec<f32>, String> {
+        Err(self.reason.clone())
+    }
+    fn execute(&self, _: &KernelOp) -> Result<KernelOutput, String> {
+        Err(self.reason.clone())
+    }
+    fn synchronize(&self) {}
 }
 
 /// Backend factory
@@ -192,24 +265,30 @@ impl BackendFactory {
 
         match bt {
             BackendType::CpuSimd => Box::new(cpu::CpuBackend::new()),
-            BackendType::Metal => {
-                #[cfg(feature = "metal")]
+            BackendType::Metal => Box::new(UnavailableBackend {
+                kind: bt,
+                reason: "Metal inference kernels are not implemented".into(),
+            }),
+            BackendType::Cuda => {
+                #[cfg(feature = "cuda")]
                 {
-                    Box::new(metal::MetalBackend::new())
+                    match cuda::CudaBackend::new() {
+                        Ok(backend) => Box::new(backend),
+                        Err(reason) => Box::new(UnavailableBackend { kind: bt, reason }),
+                    }
                 }
-                #[cfg(not(feature = "metal"))]
+                #[cfg(not(feature = "cuda"))]
                 {
-                    eprintln!("Metal backend not compiled in. Use --features metal");
-                    Box::new(cpu::CpuBackend::new())
+                    Box::new(UnavailableBackend {
+                        kind: bt,
+                        reason: "CUDA feature not compiled; enable --features cuda".into(),
+                    })
                 }
             }
-            BackendType::Cuda | BackendType::Vulkan | BackendType::WebGpu => {
-                eprintln!(
-                    "{} backend is not implemented in this build; falling back to CPU",
-                    bt.name()
-                );
-                Box::new(cpu::CpuBackend::new())
-            }
+            BackendType::Vulkan | BackendType::WebGpu => Box::new(UnavailableBackend {
+                kind: bt,
+                reason: "Inference kernels are not implemented".into(),
+            }),
         }
     }
 
@@ -223,7 +302,7 @@ impl BackendFactory {
         vec![
             cpu::CpuBackend::new().capabilities(),
             metal::MetalBackend::new().capabilities(),
-            Self::unavailable_capability(BackendType::Cuda),
+            Self::create(Some(BackendType::Cuda)).capabilities(),
             Self::unavailable_capability(BackendType::Vulkan),
             Self::unavailable_capability(BackendType::WebGpu),
         ]
@@ -278,7 +357,8 @@ mod tests {
             .any(|cap| cap.backend == BackendType::CpuSimd));
         assert!(capabilities
             .iter()
-            .any(|cap| cap.backend == BackendType::Cuda && !cap.available));
+            .any(|cap| cap.backend == BackendType::Cuda
+                && (cfg!(feature = "cuda") || !cap.available)));
         assert!(capabilities
             .iter()
             .any(|cap| cap.supported_ops.contains(&"rms_norm")));

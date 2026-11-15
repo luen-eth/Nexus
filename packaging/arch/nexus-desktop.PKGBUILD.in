@@ -1,0 +1,17 @@
+# Generated with pinned local payload checksum by scripts/build-linux-packages.py.
+# Rebuild here with: SOURCE_DATE_EPOCH=@EPOCH@ makepkg --nodeps --nocheck
+pkgname=nexus-desktop
+pkgver=@VERSION@
+pkgrel=@RELEASE@
+pkgdesc='Native Qt desktop interface for local Nexus AI models'
+arch=('any')
+url='https://github.com/luen-eth/Nexus'
+license=('Apache-2.0')
+depends=('python>=3.11' 'pyside6>=6.8' 'qt6-svg' 'qt6-wayland')
+optdepends=('nexus-engine: local GGUF inference server and command-line tools')
+source=('nexus-desktop-rootfs.tar.gz')
+sha256sums=('@PAYLOAD_SHA256@')
+options=('!strip' '!debug')
+package() {
+  cp -a "$srcdir/rootfs/." "$pkgdir/"
+}

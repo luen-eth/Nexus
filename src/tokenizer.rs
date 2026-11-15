@@ -1,9 +1,12 @@
 //! Tokenization interface.
 //!
-//! Nexus uses GGUF tokenizer metadata when present and falls back to a byte-level
-//! tokenizer for smoke tests and incomplete model metadata.
+//! Loaded models execute their full HF tokenizer or native GGUF vocabulary.
+//! The byte tokenizer is an explicit opt-in for synthetic fixtures.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+pub mod exact;
+mod template_json;
 
 use crate::gguf::ModelMetadata;
 
@@ -279,9 +282,90 @@ impl Tokenizer for GgufTokenizer {
 pub enum RuntimeTokenizer {
     Byte(ByteTokenizer),
     Gguf(Box<GgufTokenizer>),
+    Exact(Arc<exact::ExactTokenizer>),
 }
 
 impl RuntimeTokenizer {
+    pub fn from_model(
+        path: &std::path::Path,
+        metadata: &ModelMetadata,
+        vocab_size: usize,
+        allow_byte_fixture: bool,
+    ) -> Result<Self, String> {
+        if metadata.get_str("nexus.tokenizer.json").is_some()
+            || metadata.get_str("tokenizer.ggml.model").is_some()
+        {
+            return exact::ExactTokenizer::load(path, metadata, vocab_size)
+                .map(|t| Self::Exact(Arc::new(t)));
+        }
+        if allow_byte_fixture {
+            Ok(Self::from_metadata(Some(metadata)))
+        } else {
+            Err("Complete tokenizer metadata is required; byte fallback requires explicit fixture mode".into())
+        }
+    }
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Exact(t) => t.kind(),
+            Self::Byte(_) => "fixture-bytes",
+            Self::Gguf(_) => "legacy-fixture-vocab",
+        }
+    }
+    pub fn try_encode(&self, text: &str) -> Result<Vec<u32>, String> {
+        match self {
+            Self::Exact(t) => t.encode(text, true),
+            _ => Ok(self.encode(text)),
+        }
+    }
+    pub fn encode_fragment(&self, text: &str) -> Result<Vec<u32>, String> {
+        match self {
+            Self::Exact(t) => t.encode(text, false),
+            _ => Ok(self.encode(text)),
+        }
+    }
+    pub fn try_decode(&self, tokens: &[u32]) -> Result<String, String> {
+        match self {
+            Self::Exact(t) => t.decode(tokens),
+            _ => Ok(self.decode(tokens)),
+        }
+    }
+    pub fn mask_logits(&self, logits: &mut [f32]) {
+        if let Self::Exact(t) = self {
+            t.mask_logits(logits);
+        }
+    }
+    pub fn valid_id(&self, token: u32) -> bool {
+        match self {
+            Self::Exact(t) => t.valid_id(token),
+            _ => true,
+        }
+    }
+    pub fn prefix_stable(&self) -> bool {
+        match self {
+            Self::Exact(t) => t.prefix_stable(),
+            _ => true,
+        }
+    }
+    pub fn is_eog(&self, token: u32) -> bool {
+        match self {
+            Self::Exact(t) => t.is_eog(token),
+            _ => false,
+        }
+    }
+    pub fn try_render_chat_messages<'a, I>(
+        &self,
+        messages: I,
+        add_generation_prompt: bool,
+    ) -> Result<String, String>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let messages: Vec<_> = messages.into_iter().collect();
+        match self {
+            Self::Exact(t) => t.render(&messages, add_generation_prompt),
+            _ => Ok(self.render_chat_messages(messages, add_generation_prompt)),
+        }
+    }
     pub fn from_metadata(metadata: Option<&ModelMetadata>) -> Self {
         metadata
             .and_then(GgufTokenizer::from_metadata)
@@ -295,9 +379,15 @@ impl RuntimeTokenizer {
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
         let messages: Vec<(&str, &str)> = messages.into_iter().collect();
+        if let Self::Exact(t) = self {
+            return t.render(&messages, add_generation_prompt).expect(
+                "Chat template failed; use try_render_chat_messages for fallible handling",
+            );
+        }
         let template = match self {
             RuntimeTokenizer::Byte(_) => None,
             RuntimeTokenizer::Gguf(tokenizer) => tokenizer.chat_template(),
+            RuntimeTokenizer::Exact(_) => unreachable!(),
         };
 
         if let Some(template) = template {
@@ -335,6 +425,9 @@ impl Tokenizer for RuntimeTokenizer {
         match self {
             RuntimeTokenizer::Byte(tokenizer) => tokenizer.encode(text),
             RuntimeTokenizer::Gguf(tokenizer) => tokenizer.encode(text),
+            RuntimeTokenizer::Exact(tokenizer) => tokenizer
+                .encode(text, true)
+                .expect("Use try_encode for fallible handling"),
         }
     }
 
@@ -342,8 +435,39 @@ impl Tokenizer for RuntimeTokenizer {
         match self {
             RuntimeTokenizer::Byte(tokenizer) => tokenizer.decode(tokens),
             RuntimeTokenizer::Gguf(tokenizer) => tokenizer.decode(tokens),
+            RuntimeTokenizer::Exact(tokenizer) => tokenizer
+                .decode(tokens)
+                .expect("Use try_decode for fallible handling"),
         }
     }
+}
+
+/// Match API stop strings after detokenization; tokenization is context-dependent.
+/// Withhold any suffix that could still become a stop string in the next step.
+pub fn filter_stop_text<'a>(text: &'a str, stops: &[String], finished: bool) -> (&'a str, bool) {
+    if let Some(index) = stops
+        .iter()
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| text.find(s))
+        .min()
+    {
+        return (&text[..index], true);
+    }
+    if finished {
+        return (text, false);
+    }
+    let held = stops
+        .iter()
+        .flat_map(|s| {
+            s.char_indices()
+                .skip(1)
+                .map(move |(index, _)| (&s[..index], index))
+        })
+        .filter(|(prefix, _)| text.ends_with(prefix))
+        .map(|(_, len)| len)
+        .max()
+        .unwrap_or(0);
+    (&text[..text.len() - held], false)
 }
 
 fn metadata_token_id(metadata: &ModelMetadata, key: &str) -> Option<u32> {

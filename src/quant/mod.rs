@@ -620,50 +620,79 @@ impl QuantEngine {
     }
 
     /// Quantize a batch of values using the configured weight format
-    pub fn quantize_weights(&self, data: &[f32]) -> Vec<u8> {
-        match self.weight_format {
+    pub fn quantize_weights(&self, data: &[f32]) -> std::io::Result<Vec<u8>> {
+        if data.iter().any(|v| !v.is_finite()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Weights must be finite",
+            ));
+        }
+        let encoded = match self.weight_format {
             QuantFormat::FP32 => data.iter().flat_map(|&v| v.to_le_bytes()).collect(),
-            QuantFormat::FP16 => data
-                .iter()
-                .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
-                .collect(),
-            QuantFormat::Q8_0 | QuantFormat::Q8_K => Self::quantize_q8_0(data),
-            QuantFormat::Q4_0 | QuantFormat::Q4_1 | QuantFormat::MXFP4 => Self::quantize_q4_0(data),
+            QuantFormat::FP16 => {
+                if data.iter().any(|v| v.abs() > 65504.0) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "FP16 weight overflow",
+                    ));
+                }
+                data.iter()
+                    .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+                    .collect()
+            }
+            QuantFormat::Q8_0 => Self::quantize_q8_0(data),
+            QuantFormat::Q4_0 => Self::quantize_q4_0(data),
             QuantFormat::Q4_K => Self::quantize_q4_k(data),
             QuantFormat::Q2_K => Self::quantize_q2_k(data),
-            QuantFormat::Q3_K => Self::quantize_affine_nbit(data, 3),
-            QuantFormat::Q5_0 | QuantFormat::Q5_1 | QuantFormat::Q5_K => {
-                Self::quantize_affine_nbit(data, 5)
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!("Standard {other} weight encoding is not implemented"),
+                ))
             }
-            QuantFormat::Q6_K => Self::quantize_affine_nbit(data, 6),
+        };
+        let layout = match self.weight_format {
+            QuantFormat::Q8_0 => Some((34, &[0usize][..])),
+            QuantFormat::Q4_0 => Some((18, &[0usize][..])),
+            QuantFormat::Q4_K => Some((144, &[0usize, 2][..])),
+            QuantFormat::Q2_K => Some((84, &[80usize, 82][..])),
+            _ => None,
+        };
+        if let Some((block_size, offsets)) = layout {
+            for block in encoded.chunks_exact(block_size) {
+                for &offset in offsets {
+                    if !half::f16::from_bits(u16::from_le_bytes([block[offset], block[offset + 1]]))
+                        .is_finite()
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "Quantization scale overflow",
+                        ));
+                    }
+                }
+            }
         }
+        Ok(encoded)
     }
 
-    /// Dequantize a batch of values back to f32
-    pub fn dequantize(&self, data: &[u8], output_len: usize) -> Vec<f32> {
-        match self.weight_format {
-            QuantFormat::FP32 => data
-                .chunks_exact(4)
-                .take(output_len)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            QuantFormat::FP16 => data
-                .chunks_exact(2)
-                .take(output_len)
-                .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-                .collect(),
-            QuantFormat::Q8_0 | QuantFormat::Q8_K => Self::dequantize_q8_0(data, output_len),
-            QuantFormat::Q4_0 | QuantFormat::Q4_1 | QuantFormat::MXFP4 => {
-                Self::dequantize_q4_0(data, output_len)
+    /// Decode only implemented standard GGUF codecs; malformed payloads are errors.
+    pub fn dequantize(&self, data: &[u8], output_len: usize) -> std::io::Result<Vec<f32>> {
+        use crate::gguf::{GgufDataType as T, GgufReader};
+        let format = match self.weight_format {
+            QuantFormat::FP32 => T::F32,
+            QuantFormat::FP16 => T::F16,
+            QuantFormat::Q8_0 => T::Q8_0,
+            QuantFormat::Q4_0 => T::Q4_0,
+            QuantFormat::Q4_K => T::Q4_K,
+            QuantFormat::Q2_K => T::Q2_K,
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!("Standard {other} weight decoding is not implemented"),
+                ))
             }
-            QuantFormat::Q4_K => Self::dequantize_q4_k(data, output_len),
-            QuantFormat::Q2_K => Self::dequantize_q2_k(data, output_len),
-            QuantFormat::Q3_K => Self::dequantize_affine_nbit(data, output_len, 3),
-            QuantFormat::Q5_0 | QuantFormat::Q5_1 | QuantFormat::Q5_K => {
-                Self::dequantize_affine_nbit(data, output_len, 5)
-            }
-            QuantFormat::Q6_K => Self::dequantize_affine_nbit(data, output_len, 6),
-        }
+        };
+        GgufReader::tensor_bytes_to_f32(format, output_len, data)
     }
 
     fn quantize_q8_0(data: &[f32]) -> Vec<u8> {
@@ -686,22 +715,6 @@ impl QuantEngine {
         out
     }
 
-    fn dequantize_q8_0(data: &[u8], output_len: usize) -> Vec<f32> {
-        const QK: usize = 32;
-        const BLOCK: usize = 2 + QK;
-        let mut out = Vec::with_capacity(output_len);
-        for block in data.chunks_exact(BLOCK) {
-            let scale = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
-            for &q in &block[2..] {
-                out.push((q as i8) as f32 * scale);
-                if out.len() == output_len {
-                    return out;
-                }
-            }
-        }
-        out
-    }
-
     fn quantize_q4_0(data: &[f32]) -> Vec<u8> {
         const QK: usize = 32;
         const QB: usize = QK / 2;
@@ -715,30 +728,6 @@ impl QuantEngine {
                 let hi =
                     Self::quantize_symmetric_4bit(chunk.get(i + QB).copied().unwrap_or(0.0), scale);
                 out.push((lo & 0x0f) | ((hi & 0x0f) << 4));
-            }
-        }
-        out
-    }
-
-    fn dequantize_q4_0(data: &[u8], output_len: usize) -> Vec<f32> {
-        const QK: usize = 32;
-        const QB: usize = QK / 2;
-        const BLOCK: usize = 2 + QB;
-        let mut out = Vec::with_capacity(output_len);
-        for block in data.chunks_exact(BLOCK) {
-            let scale = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
-            let qs = &block[2..];
-            for &packed in qs {
-                out.push(((packed & 0x0f) as i8 - 8) as f32 * scale);
-                if out.len() == output_len {
-                    return out;
-                }
-            }
-            for &packed in qs {
-                out.push(((packed >> 4) as i8 - 8) as f32 * scale);
-                if out.len() == output_len {
-                    return out;
-                }
             }
         }
         out
@@ -802,46 +791,23 @@ impl QuantEngine {
             let qs_start = out.len();
             out.resize(qs_start + QK / 2, 0);
             for i in 0..QK / 2 {
-                let lo = quantize_q4_k_value(block[i], d, dmin, scales[i / SUB], mins[i / SUB]);
-                let hi = quantize_q4_k_value(
-                    block[i + QK / 2],
+                let lo_index = (i / 32) * 64 + i % 32;
+                let hi_index = lo_index + 32;
+                let lo = quantize_q4_k_value(
+                    block[lo_index],
                     d,
                     dmin,
-                    scales[(i + QK / 2) / SUB],
-                    mins[(i + QK / 2) / SUB],
+                    scales[lo_index / SUB],
+                    mins[lo_index / SUB],
+                );
+                let hi = quantize_q4_k_value(
+                    block[hi_index],
+                    d,
+                    dmin,
+                    scales[hi_index / SUB],
+                    mins[hi_index / SUB],
                 );
                 out[qs_start + i] = (lo & 0x0f) | ((hi & 0x0f) << 4);
-            }
-        }
-
-        out
-    }
-
-    fn dequantize_q4_k(data: &[u8], output_len: usize) -> Vec<f32> {
-        const QK: usize = 256;
-        const BLOCK: usize = 144;
-        let mut out = Vec::with_capacity(output_len);
-
-        for block in data.chunks_exact(BLOCK) {
-            let d = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
-            let dmin = half::f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
-            let mut scales = [0u8; 8];
-            let mut mins = [0u8; 8];
-            unpack_q4_k_scales(&block[4..16], &mut scales, &mut mins);
-            let qs = &block[16..];
-
-            for i in 0..QK {
-                let packed = qs[i % (QK / 2)];
-                let q = if i < QK / 2 {
-                    packed & 0x0f
-                } else {
-                    packed >> 4
-                };
-                let sub = i / 32;
-                out.push(d * scales[sub] as f32 * q as f32 - dmin * mins[sub] as f32);
-                if out.len() == output_len {
-                    return out;
-                }
             }
         }
 
@@ -900,7 +866,7 @@ impl QuantEngine {
                 let scale_q = packed & 0x0f;
                 let min_q = packed >> 4;
                 let q = quantize_q2_k_value(block[i], d, dmin, scale_q, min_q);
-                out[qs_start + i / 4] |= (q & 0x03) << ((i % 4) * 2);
+                out[qs_start + (i / 128) * 32 + i % 32] |= (q & 0x03) << (2 * ((i % 128) / 32));
             }
 
             out.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
@@ -908,109 +874,6 @@ impl QuantEngine {
         }
 
         out
-    }
-
-    fn dequantize_q2_k(data: &[u8], output_len: usize) -> Vec<f32> {
-        const QK: usize = 256;
-        const BLOCK: usize = 84;
-        let mut out = Vec::with_capacity(output_len);
-
-        for block in data.chunks_exact(BLOCK) {
-            let scales = &block[..16];
-            let qs = &block[16..80];
-            let d = half::f16::from_bits(u16::from_le_bytes([block[80], block[81]])).to_f32();
-            let dmin = half::f16::from_bits(u16::from_le_bytes([block[82], block[83]])).to_f32();
-
-            for i in 0..QK {
-                let q = (qs[i / 4] >> ((i % 4) * 2)) & 0x03;
-                let packed = scales[i / 16];
-                let scale = (packed & 0x0f) as f32;
-                let min = (packed >> 4) as f32;
-                out.push(d * scale * q as f32 - dmin * min);
-                if out.len() == output_len {
-                    return out;
-                }
-            }
-        }
-
-        out
-    }
-
-    fn quantize_affine_nbit(data: &[f32], bits: u32) -> Vec<u8> {
-        const QK: usize = 32;
-        let packed_bytes = (QK * bits as usize).div_ceil(8);
-        let mut out = Vec::with_capacity(data.len().div_ceil(QK) * (4 + packed_bytes));
-        let levels = (1u32 << bits) - 1;
-
-        for chunk in data.chunks(QK) {
-            let min = chunk.iter().copied().fold(f32::INFINITY, f32::min);
-            let max = chunk.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let scale = if (max - min).abs() > 1e-8 {
-                (max - min) / levels as f32
-            } else {
-                1.0
-            };
-            out.extend_from_slice(&half::f16::from_f32(min).to_bits().to_le_bytes());
-            out.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
-            let packed_start = out.len();
-            out.resize(packed_start + packed_bytes, 0);
-
-            for i in 0..QK {
-                let value = chunk.get(i).copied().unwrap_or(min);
-                let q = ((value - min) / scale).round().clamp(0.0, levels as f32) as u32;
-                Self::write_bits(
-                    &mut out[packed_start..packed_start + packed_bytes],
-                    i,
-                    bits,
-                    q,
-                );
-            }
-        }
-        out
-    }
-
-    fn dequantize_affine_nbit(data: &[u8], output_len: usize, bits: u32) -> Vec<f32> {
-        const QK: usize = 32;
-        let packed_bytes = (QK * bits as usize).div_ceil(8);
-        let block_bytes = 4 + packed_bytes;
-        let mut out = Vec::with_capacity(output_len);
-        let mask = (1u32 << bits) - 1;
-
-        for block in data.chunks_exact(block_bytes) {
-            let min = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
-            let scale = half::f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
-            let packed = &block[4..];
-            for i in 0..QK {
-                let q = Self::read_bits(packed, i, bits) & mask;
-                out.push(min + q as f32 * scale);
-                if out.len() == output_len {
-                    return out;
-                }
-            }
-        }
-        out
-    }
-
-    fn write_bits(data: &mut [u8], index: usize, bits: u32, value: u32) {
-        let bit_offset = index * bits as usize;
-        for bit in 0..bits as usize {
-            if ((value >> bit) & 1) == 0 {
-                continue;
-            }
-            let absolute = bit_offset + bit;
-            data[absolute / 8] |= 1 << (absolute % 8);
-        }
-    }
-
-    fn read_bits(data: &[u8], index: usize, bits: u32) -> u32 {
-        let bit_offset = index * bits as usize;
-        let mut value = 0u32;
-        for bit in 0..bits as usize {
-            let absolute = bit_offset + bit;
-            let bit_value = (data[absolute / 8] >> (absolute % 8)) & 1;
-            value |= (bit_value as u32) << bit;
-        }
-        value
     }
 
     /// TurboQuant: quantize KV cache entries
@@ -1160,15 +1023,6 @@ fn pack_q4_k_scales(scales: &[u8; 8], mins: &[u8; 8]) -> [u8; 12] {
     out
 }
 
-fn unpack_q4_k_scales(packed: &[u8], scales: &mut [u8; 8], mins: &mut [u8; 8]) {
-    for i in 0..4 {
-        scales[i] = packed[i] & 0x3f;
-        mins[i] = packed[i + 4] & 0x3f;
-        scales[i + 4] = (packed[i + 8] & 0x0f) | ((packed[i] >> 6) << 4);
-        mins[i + 4] = (packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4);
-    }
-}
-
 impl Default for QuantEngine {
     fn default() -> Self {
         QuantEngine::new(QuantFormat::Q4_K, KvQuantType::TurboQuant3b2b)
@@ -1276,7 +1130,7 @@ mod tests {
 
         // Test weight quantization
         let data: Vec<f32> = (0..64).map(|i| i as f32 * 0.1 - 3.2).collect();
-        let quantized = engine.quantize_weights(&data);
+        let quantized = engine.quantize_weights(&data).unwrap();
         assert!(!quantized.is_empty());
 
         // Test KV cache memory calculation
@@ -1288,8 +1142,8 @@ mod tests {
     fn test_q8_weight_quant_roundtrip() {
         let engine = QuantEngine::new(QuantFormat::Q8_0, KvQuantType::None);
         let data: Vec<f32> = (0..64).map(|i| i as f32 / 16.0 - 2.0).collect();
-        let quantized = engine.quantize_weights(&data);
-        let decoded = engine.dequantize(&quantized, data.len());
+        let quantized = engine.quantize_weights(&data).unwrap();
+        let decoded = engine.dequantize(&quantized, data.len()).unwrap();
 
         assert_eq!(decoded.len(), data.len());
         for (actual, expected) in decoded.iter().zip(data.iter()) {
@@ -1301,8 +1155,8 @@ mod tests {
     fn test_q4_weight_quant_roundtrip() {
         let engine = QuantEngine::new(QuantFormat::Q4_0, KvQuantType::None);
         let data: Vec<f32> = (0..64).map(|i| i as f32 / 16.0 - 2.0).collect();
-        let quantized = engine.quantize_weights(&data);
-        let decoded = engine.dequantize(&quantized, data.len());
+        let quantized = engine.quantize_weights(&data).unwrap();
+        let decoded = engine.dequantize(&quantized, data.len()).unwrap();
 
         assert_eq!(decoded.len(), data.len());
         for (actual, expected) in decoded.iter().zip(data.iter()) {
@@ -1314,9 +1168,9 @@ mod tests {
     fn test_q4_k_weight_quant_roundtrip() {
         let engine = QuantEngine::new(QuantFormat::Q4_K, KvQuantType::None);
         let data: Vec<f32> = (0..300).map(|i| i as f32 / 31.0 - 4.0).collect();
-        let quantized = engine.quantize_weights(&data);
+        let quantized = engine.quantize_weights(&data).unwrap();
         assert_eq!(quantized.len(), data.len().div_ceil(256) * 144);
-        let decoded = engine.dequantize(&quantized, data.len());
+        let decoded = engine.dequantize(&quantized, data.len()).unwrap();
 
         assert_eq!(decoded.len(), data.len());
         for (actual, expected) in decoded.iter().zip(data.iter()) {
@@ -1328,9 +1182,9 @@ mod tests {
     fn test_q2_k_weight_quant_roundtrip() {
         let engine = QuantEngine::new(QuantFormat::Q2_K, KvQuantType::None);
         let data: Vec<f32> = (0..300).map(|i| i as f32 / 31.0 - 4.0).collect();
-        let quantized = engine.quantize_weights(&data);
+        let quantized = engine.quantize_weights(&data).unwrap();
         assert_eq!(quantized.len(), data.len().div_ceil(256) * 84);
-        let decoded = engine.dequantize(&quantized, data.len());
+        let decoded = engine.dequantize(&quantized, data.len()).unwrap();
 
         assert_eq!(decoded.len(), data.len());
         for (actual, expected) in decoded.iter().zip(data.iter()) {
@@ -1339,15 +1193,26 @@ mod tests {
     }
 
     #[test]
-    fn test_affine_nbit_weight_quant_roundtrip() {
-        let engine = QuantEngine::new(QuantFormat::Q3_K, KvQuantType::None);
-        let data: Vec<f32> = (0..64).map(|i| i as f32 / 16.0 - 2.0).collect();
-        let quantized = engine.quantize_weights(&data);
-        let decoded = engine.dequantize(&quantized, data.len());
-
-        assert_eq!(decoded.len(), data.len());
-        for (actual, expected) in decoded.iter().zip(data.iter()) {
-            assert!((actual - expected).abs() < 0.6);
+    fn unsupported_standard_formats_are_explicit_errors() {
+        for format in [
+            QuantFormat::Q3_K,
+            QuantFormat::Q4_1,
+            QuantFormat::Q5_0,
+            QuantFormat::Q5_1,
+            QuantFormat::Q5_K,
+            QuantFormat::Q6_K,
+            QuantFormat::Q8_K,
+            QuantFormat::MXFP4,
+        ] {
+            let engine = QuantEngine::new(format, KvQuantType::None);
+            assert_eq!(
+                engine.quantize_weights(&[1.; 256]).unwrap_err().kind(),
+                std::io::ErrorKind::Unsupported
+            );
+            assert_eq!(
+                engine.dequantize(&[], 256).unwrap_err().kind(),
+                std::io::ErrorKind::Unsupported
+            );
         }
     }
 

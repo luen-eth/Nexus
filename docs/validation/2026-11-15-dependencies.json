@@ -1,0 +1,290 @@
+{
+  "date": "2026-11-15",
+  "tool": "cargo-audit 0.23.0",
+  "tool_archive_sha256": "b77993532b253fcbf550996d7716465ec3d734d4e74e7f87bfb65a19add0fb59",
+  "database": {
+    "url": "https://github.com/RustSec/advisory-db",
+    "commit": "02e2517f457a359fc6d3440ea4560c8ea188fee8",
+    "advisory_count": 1509
+  },
+  "command": "cargo-audit audit --deny unsound",
+  "ignored_advisories": [],
+  "before_vulnerability_count": 5,
+  "after_vulnerability_count": 0,
+  "after_unsound_count": 0,
+  "remaining_warnings": [
+    {
+      "kind": "unmaintained",
+      "advisory": "RUSTSEC-2024-0436",
+      "package": "paste",
+      "version": "1.0.15"
+    }
+  ],
+  "changed_packages": [
+    {
+      "name": "anyhow",
+      "before": [
+        "1.0.102"
+      ],
+      "after": [
+        "1.0.104"
+      ]
+    },
+    {
+      "name": "base64",
+      "before": [
+        "0.13.1",
+        "0.21.7"
+      ],
+      "after": [
+        "0.13.1",
+        "0.22.1"
+      ]
+    },
+    {
+      "name": "crossbeam-epoch",
+      "before": [
+        "0.9.18"
+      ],
+      "after": [
+        "0.9.21"
+      ]
+    },
+    {
+      "name": "h2",
+      "before": [
+        "0.3.27"
+      ],
+      "after": [
+        "0.4.20"
+      ]
+    },
+    {
+      "name": "http",
+      "before": [
+        "0.2.12",
+        "1.4.0"
+      ],
+      "after": [
+        "1.4.0"
+      ]
+    },
+    {
+      "name": "http-body",
+      "before": [
+        "0.4.6",
+        "1.0.1"
+      ],
+      "after": [
+        "1.0.1"
+      ]
+    },
+    {
+      "name": "hyper",
+      "before": [
+        "0.14.32",
+        "1.9.0"
+      ],
+      "after": [
+        "1.9.0"
+      ]
+    },
+    {
+      "name": "hyper-rustls",
+      "before": [],
+      "after": [
+        "0.27.10"
+      ]
+    },
+    {
+      "name": "hyper-tls",
+      "before": [
+        "0.5.0"
+      ],
+      "after": [
+        "0.6.0"
+      ]
+    },
+    {
+      "name": "memmap2",
+      "before": [
+        "0.9.10"
+      ],
+      "after": [
+        "0.9.12"
+      ]
+    },
+    {
+      "name": "openssl",
+      "before": [
+        "0.10.78"
+      ],
+      "after": [
+        "0.10.82"
+      ]
+    },
+    {
+      "name": "openssl-sys",
+      "before": [
+        "0.9.114"
+      ],
+      "after": [
+        "0.9.118"
+      ]
+    },
+    {
+      "name": "reqwest",
+      "before": [
+        "0.11.27"
+      ],
+      "after": [
+        "0.12.28"
+      ]
+    },
+    {
+      "name": "ring",
+      "before": [],
+      "after": [
+        "0.17.14"
+      ]
+    },
+    {
+      "name": "rustix",
+      "before": [
+        "1.1.4"
+      ],
+      "after": [
+        "1.1.6"
+      ]
+    },
+    {
+      "name": "rustls",
+      "before": [],
+      "after": [
+        "0.23.46"
+      ]
+    },
+    {
+      "name": "rustls-pemfile",
+      "before": [
+        "1.0.4"
+      ],
+      "after": []
+    },
+    {
+      "name": "rustls-pki-types",
+      "before": [],
+      "after": [
+        "1.16.0"
+      ]
+    },
+    {
+      "name": "rustls-webpki",
+      "before": [],
+      "after": [
+        "0.103.17"
+      ]
+    },
+    {
+      "name": "socket2",
+      "before": [
+        "0.5.10",
+        "0.6.3"
+      ],
+      "after": [
+        "0.6.3"
+      ]
+    },
+    {
+      "name": "subtle",
+      "before": [],
+      "after": [
+        "2.6.1"
+      ]
+    },
+    {
+      "name": "sync_wrapper",
+      "before": [
+        "0.1.2",
+        "1.0.2"
+      ],
+      "after": [
+        "1.0.2"
+      ]
+    },
+    {
+      "name": "system-configuration",
+      "before": [
+        "0.5.1"
+      ],
+      "after": [
+        "0.7.0"
+      ]
+    },
+    {
+      "name": "system-configuration-sys",
+      "before": [
+        "0.5.0"
+      ],
+      "after": [
+        "0.6.0"
+      ]
+    },
+    {
+      "name": "tokio",
+      "before": [
+        "1.52.1"
+      ],
+      "after": [
+        "1.53.3"
+      ]
+    },
+    {
+      "name": "tokio-rustls",
+      "before": [],
+      "after": [
+        "0.26.6"
+      ]
+    },
+    {
+      "name": "tower-http",
+      "before": [],
+      "after": [
+        "0.6.11"
+      ]
+    },
+    {
+      "name": "untrusted",
+      "before": [],
+      "after": [
+        "0.9.0"
+      ]
+    },
+    {
+      "name": "windows-registry",
+      "before": [],
+      "after": [
+        "0.6.1"
+      ]
+    },
+    {
+      "name": "winreg",
+      "before": [
+        "0.50.0"
+      ],
+      "after": []
+    },
+    {
+      "name": "zeroize",
+      "before": [],
+      "after": [
+        "1.9.1"
+      ]
+    }
+  ],
+  "source_hashes": {
+    "Cargo.toml": "18000bc15410d366e6d9b37581d2158a7e9c384f67c365ee7273d59907b46b39",
+    "Cargo.lock": "052d97f4afb24b144a2314f931a1c4290dabb93fa5bcff73e47f43da957396d5"
+  },
+  "scope": "Crates.io lockfile advisory matching, not a proof of reachability or an audit of OS/CUDA/Python libraries."
+}

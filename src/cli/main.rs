@@ -2,15 +2,18 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
-use nexus::backend::BackendType;
+use nexus::backend::{cpu::CpuBackend, BackendType};
 use nexus::download;
 use nexus::engine::{GenerationConfig, InferenceConfig, InferenceEngine};
 use nexus::quant::{KvQuantType, QuantFormat};
-use nexus::tokenizer::{RuntimeTokenizer, Tokenizer};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -36,7 +39,7 @@ enum Commands {
         prompt: Option<String>,
 
         /// Number of tokens to generate
-        #[arg(short, long, default_value = "128")]
+        #[arg(short = 'n', long, default_value = "128")]
         max_tokens: usize,
 
         /// Sampling temperature; 0 means greedy decoding
@@ -71,17 +74,20 @@ enum Commands {
         #[arg(long, default_value = "tq_3b2b")]
         kv_quant: String,
 
-        /// Weight quantization format
-        #[arg(long, default_value = "Q4_K")]
+        /// Runtime weight storage (FP32 only); use convert for file quantization.
+        #[arg(long, default_value = "FP32")]
         weight_quant: String,
 
-        /// Backend to use (cpu-simd, metal)
+        /// Backend to use (cpu-simd, cuda); CUDA requires --features cuda
         #[arg(long, default_value = "auto")]
         backend: String,
 
-        /// Number of threads for CPU backend
+        /// CPU matvec thread limit (default: 1). Small matrices stay serial.
         #[arg(long)]
         threads: Option<usize>,
+        /// Allow a byte tokenizer only for synthetic test fixtures.
+        #[arg(long)]
+        allow_byte_tokenizer: bool,
     },
 
     /// Run a benchmark
@@ -106,7 +112,27 @@ enum Commands {
         #[arg(long, default_value_t = 64)]
         max_tokens: usize,
 
-        /// Emit machine-readable JSON
+        /// Warmup runs per prompt length, excluded from measured results.
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+
+        /// Backend to benchmark (cpu-simd or cuda).
+        #[arg(long, default_value = "auto")]
+        backend: String,
+
+        /// CPU matvec thread limit (default: 1). Rejected for CUDA.
+        #[arg(long)]
+        threads: Option<usize>,
+
+        /// KV format used for the benchmark.
+        #[arg(long, default_value = "tq_3b2b")]
+        kv_quant: String,
+
+        /// Allow a byte tokenizer only for synthetic test fixtures.
+        #[arg(long)]
+        allow_byte_tokenizer: bool,
+
+        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
@@ -154,7 +180,7 @@ enum Commands {
 
     /// Download a model from HuggingFace
     Download {
-        /// Model identifier (repo_id/filename or index from list)
+        /// Model identifier (owner/repository/path/to/file or index from list)
         #[arg(short, long)]
         model: Option<String>,
 
@@ -175,6 +201,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "nexus=info,llama_cpp=warn".into()),
@@ -199,6 +226,7 @@ async fn main() -> Result<()> {
             weight_quant,
             backend,
             threads,
+            allow_byte_tokenizer,
         }) => {
             let generation = GenerationConfig {
                 max_tokens,
@@ -219,6 +247,7 @@ async fn main() -> Result<()> {
                 &weight_quant,
                 &backend,
                 threads,
+                allow_byte_tokenizer,
             )
             .await?;
         }
@@ -228,10 +257,26 @@ async fn main() -> Result<()> {
             prompt_len,
             prompt_lens,
             max_tokens,
+            warmup,
+            backend,
+            threads,
+            kv_quant,
+            allow_byte_tokenizer,
             json,
         }) => {
             let prompt_lens = prompt_lens.unwrap_or_else(|| vec![prompt_len]);
-            run_benchmark(model, iterations, prompt_lens, max_tokens, json).await?;
+            run_benchmark(
+                model,
+                iterations,
+                prompt_lens,
+                max_tokens,
+                warmup,
+                &backend,
+                threads,
+                &kv_quant,
+                allow_byte_tokenizer,
+                json,
+            )?;
         }
         Some(Commands::Golden {
             model,
@@ -308,26 +353,33 @@ async fn run_inference(
     kv_quant: &str,
     weight_quant: &str,
     backend: &str,
-    _threads: Option<usize>,
+    threads: Option<usize>,
+    allow_byte_tokenizer: bool,
 ) -> Result<()> {
     // Parse configuration
-    let kv_quant_type = KvQuantType::from_str(kv_quant).unwrap_or(KvQuantType::TurboQuant3b2b);
-    let weight_format = QuantFormat::from_str(weight_quant).unwrap_or(QuantFormat::Q4_K);
+    let kv_quant_type = KvQuantType::from_str(&kv_quant.to_ascii_lowercase().replace('-', "_"))
+        .ok_or_else(|| anyhow::anyhow!("Unsupported KV quantization: {}", kv_quant))?;
+    let weight_format = QuantFormat::from_str(&weight_quant.to_ascii_uppercase().replace('-', "_"))
+        .ok_or_else(|| anyhow::anyhow!("Unsupported weight quantization: {}", weight_quant))?;
+    if weight_format != QuantFormat::FP32 {
+        anyhow::bail!("Runtime weights expand to F32; --weight-quant accepts FP32 only. Use the converter for file quantization");
+    }
 
     let backend_type = match backend {
-        "cpu" | "cpu-simd" => BackendType::CpuSimd,
-        "metal" => BackendType::Metal,
-        "cuda" | "vulkan" | "webgpu" => {
+        "auto" | "cpu" | "cpu-simd" => BackendType::CpuSimd,
+        "cuda" if cfg!(feature = "cuda") => BackendType::Cuda,
+        "metal" | "cuda" | "vulkan" | "webgpu" => {
             anyhow::bail!(
-                "Backend '{}' is listed in capabilities but not implemented yet; use cpu-simd or metal",
+                "Backend '{}' inference kernels are not implemented; use cpu-simd",
                 backend
             );
         }
-        _ => BackendType::default(),
+        other => anyhow::bail!("Unsupported backend: {}", other),
     };
 
     let config = InferenceConfig {
         max_seq_len: ctx_size,
+        allow_byte_tokenizer,
         kv_quant: kv_quant_type,
         weight_format,
         backend: backend_type,
@@ -336,9 +388,14 @@ async fn run_inference(
 
     // Create engine
     let mut engine = InferenceEngine::new(Some(config));
+    let cpu_threads = configure_cpu_threads(&mut engine, threads)?;
 
     println!("Loading model: {}", model_path.display());
     println!("Backend: {}", engine.backend.name());
+    if let Some((threads, kernel)) = cpu_threads {
+        println!("CPU matvec thread limit: {threads} (small matrices stay serial)");
+        println!("CPU matvec kernel: {kernel}");
+    }
     println!("KV Quant: {}", kv_quant_type.name());
     println!("Weight Quant: {}", weight_format.name());
     println!();
@@ -378,20 +435,30 @@ async fn run_inference(
         println!("Prompt: {}", prompt_text);
         println!("---");
 
-        let tokenizer =
-            RuntimeTokenizer::from_metadata(engine.model.as_ref().map(|model| model.metadata()));
-        generation.stop_sequences = stop
-            .iter()
-            .map(|sequence| tokenizer.encode(sequence))
-            .collect();
-        let tokens = tokenizer.encode(&prompt_text);
-
-        match engine.generate_with_config(&tokens, &generation) {
-            Ok(output) => {
-                let generated = tokenizer.decode(&output[tokens.len()..]);
-                println!("{}", generated);
+        let tokenizer = engine
+            .tokenizer
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Tokenizer not loaded"))?;
+        generation.stop_sequences.clear();
+        let tokens = tokenizer
+            .try_encode(&prompt_text)
+            .map_err(anyhow::Error::msg)?;
+        let mut session = engine
+            .start_session(&tokens, &generation)
+            .map_err(anyhow::Error::msg)?;
+        while !session.finished {
+            engine
+                .step_session(&mut session)
+                .map_err(anyhow::Error::msg)?;
+            let decoded = tokenizer
+                .try_decode(session.visible_output())
+                .map_err(anyhow::Error::msg)?;
+            let (visible, matched) =
+                nexus::tokenizer::filter_stop_text(&decoded, &stop, session.finished);
+            if matched || session.finished {
+                println!("{}", visible);
+                break;
             }
-            Err(e) => eprintln!("Error during generation: {}", e),
         }
     } else {
         println!("No prompt provided. Use -p 'text' to generate text.");
@@ -405,107 +472,243 @@ async fn run_inference(
     Ok(())
 }
 
-async fn run_benchmark(
+fn configure_cpu_threads(
+    engine: &mut InferenceEngine,
+    threads: Option<usize>,
+) -> Result<Option<(usize, &'static str)>> {
+    if engine.config.backend != BackendType::CpuSimd {
+        if threads.is_some() {
+            anyhow::bail!("--threads is only supported for the CPU backend");
+        }
+        return Ok(None);
+    }
+    let count = threads.unwrap_or(1);
+    let cpu = CpuBackend::with_threads(count).map_err(anyhow::Error::msg)?;
+    let kernel = cpu.matvec_kernel();
+    engine.backend = Box::new(cpu);
+    Ok(Some((count, kernel)))
+}
+
+#[derive(Serialize)]
+struct BenchmarkSample {
+    iteration: usize,
+    generated_tokens: usize,
+    prefill_seconds: f64,
+    decode_seconds: f64,
+    elapsed_seconds: f64,
+    first_token_seconds: Option<f64>,
+    tokens_per_second: f64,
+    decode_tokens_per_second: f64,
+    finish_reason: String,
+}
+
+fn benchmark_sample(
+    engine: &mut InferenceEngine,
+    prompt: &[u32],
+    max_tokens: usize,
+    iteration: usize,
+) -> Result<BenchmarkSample> {
+    let start = Instant::now();
+    let mut session = engine
+        .start_session(
+            prompt,
+            &GenerationConfig {
+                max_tokens,
+                temperature: 0.0,
+                seed: Some(42),
+                ..Default::default()
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+    // start_session allocates private caches; step_session advances one prefill
+    // token per call. Include session setup in the prefill phase.
+    for _ in 0..prompt.len() {
+        if engine
+            .step_session(&mut session)
+            .map_err(anyhow::Error::msg)?
+            .is_some()
+            || session.finished
+        {
+            anyhow::bail!("Generation session did not preserve the prefill boundary");
+        }
+    }
+    let prefill_seconds = start.elapsed().as_secs_f64();
+    let decode_start = Instant::now();
+    let mut first_token_seconds = None;
+    while !session.finished {
+        if engine
+            .step_session(&mut session)
+            .map_err(anyhow::Error::msg)?
+            .is_some()
+            && first_token_seconds.is_none()
+        {
+            first_token_seconds = Some(start.elapsed().as_secs_f64());
+        }
+    }
+    let decode_seconds = decode_start.elapsed().as_secs_f64();
+    let elapsed_seconds = start.elapsed().as_secs_f64();
+    let generated_tokens = session.output.len().saturating_sub(prompt.len());
+    Ok(BenchmarkSample {
+        iteration,
+        generated_tokens,
+        prefill_seconds,
+        decode_seconds,
+        elapsed_seconds,
+        first_token_seconds,
+        tokens_per_second: rate(generated_tokens, elapsed_seconds),
+        decode_tokens_per_second: rate(generated_tokens, decode_seconds),
+        finish_reason: session.finish_reason.into(),
+    })
+}
+
+fn rate(count: usize, seconds: f64) -> f64 {
+    if seconds > 0.0 {
+        count as f64 / seconds
+    } else {
+        0.0
+    }
+}
+
+fn percentiles(mut values: Vec<f64>) -> serde_json::Value {
+    values.sort_by(f64::total_cmp);
+    // Nearest-rank percentiles. Called only after at least one measured run.
+    let percentile = |p: f64| values[((p * values.len() as f64).ceil() as usize).saturating_sub(1)];
+    serde_json::json!({"p50":percentile(0.5),"p95":percentile(0.95)})
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_benchmark(
     model_path: PathBuf,
     iterations: usize,
     prompt_lens: Vec<usize>,
     max_tokens: usize,
+    warmup: usize,
+    backend: &str,
+    threads: Option<usize>,
+    kv_quant: &str,
+    allow_byte_tokenizer: bool,
     json: bool,
 ) -> Result<()> {
-    if !json {
-        println!("Running benchmark with {} iterations...", iterations);
-        println!("Model: {}", model_path.display());
-        println!();
+    if iterations == 0 || max_tokens == 0 || prompt_lens.is_empty() || prompt_lens.contains(&0) {
+        anyhow::bail!("Benchmark iterations, max_tokens and prompt lengths must be positive");
     }
-
-    let config = InferenceConfig::default();
-    let mut engine = InferenceEngine::new(Some(config));
-
-    match engine.load_model(&model_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("Model file not found: {}", model_path.display());
-            std::process::exit(1);
+    let backend = match backend {
+        "auto" | "cpu" | "cpu-simd" => BackendType::CpuSimd,
+        "cuda" if cfg!(feature = "cuda") => BackendType::Cuda,
+        other => anyhow::bail!("Unsupported benchmark backend: {other}"),
+    };
+    let kv_quant = KvQuantType::from_str(&kv_quant.to_ascii_lowercase().replace('-', "_"))
+        .ok_or_else(|| anyhow::anyhow!("Unsupported KV quantization: {kv_quant}"))?;
+    let mut engine = InferenceEngine::new(Some(InferenceConfig {
+        backend,
+        kv_quant,
+        allow_byte_tokenizer,
+        ..Default::default()
+    }));
+    let cpu_threads = configure_cpu_threads(&mut engine, threads)?;
+    let model_sha256 = sha256_file(&model_path)?;
+    let loading = Instant::now();
+    engine.load_model(&model_path)?;
+    let model_load_seconds = loading.elapsed().as_secs_f64();
+    for &len in &prompt_lens {
+        if len
+            .checked_add(max_tokens)
+            .is_none_or(|n| n > engine.config.max_seq_len)
+        {
+            anyhow::bail!(
+                "Benchmark prompt length {len} plus max_tokens exceeds context length {}",
+                engine.config.max_seq_len
+            );
         }
-        Err(e) => return Err(e.into()),
     }
-
+    let tokenizer = engine
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Tokenizer not loaded"))?;
+    let needed = *prompt_lens.iter().max().unwrap();
+    let valid_ids: Vec<u32> = (0..engine.vocab_size)
+        .filter_map(|id| u32::try_from(id).ok())
+        .filter(|&id| tokenizer.valid_id(id))
+        .take(needed)
+        .collect();
+    if valid_ids.is_empty() {
+        anyhow::bail!("Benchmark model has no valid vocabulary IDs");
+    }
     if !json {
-        println!("{}", engine.info());
-        println!();
+        println!("{}\nWarmup runs per row: {warmup}", engine.info());
     }
-
     let mut matrix = Vec::new();
     for prompt_len in prompt_lens {
-        let test_tokens: Vec<u32> = (0..prompt_len).map(|i| i as u32).collect();
-        let mut results = Vec::new();
-
-        if !json {
-            println!("Prompt length: {}", prompt_len);
+        // Deterministic synthetic IDs, repeated within the model's valid vocabulary.
+        let prompt: Vec<u32> = valid_ids.iter().copied().cycle().take(prompt_len).collect();
+        for _ in 0..warmup {
+            benchmark_sample(&mut engine, &prompt, max_tokens, 0)?;
         }
-        for i in 0..iterations {
-            let start = std::time::Instant::now();
-            match engine.generate(&test_tokens, max_tokens) {
-                Ok(_) => {
-                    let elapsed = start.elapsed();
-                    let tokens_per_sec = max_tokens as f64 / elapsed.as_secs_f64();
-                    results.push(serde_json::json!({
-                        "iteration": i + 1,
-                        "elapsed_seconds": elapsed.as_secs_f64(),
-                        "tokens_per_second": tokens_per_sec,
-                    }));
-                    if !json {
-                        println!(
-                            "  Iteration {}: {:.2} tok/s ({:.3}s)",
-                            i + 1,
-                            tokens_per_sec,
-                            elapsed.as_secs_f64()
-                        );
-                    }
-                }
-                Err(e) => {
-                    if json {
-                        results.push(serde_json::json!({
-                            "iteration": i + 1,
-                            "error": e,
-                        }));
-                    } else {
-                        eprintln!("  Iteration {} failed: {}", i + 1, e);
-                    }
-                }
+        let mut results = Vec::with_capacity(iterations);
+        for iteration in 1..=iterations {
+            let sample = benchmark_sample(&mut engine, &prompt, max_tokens, iteration)?;
+            if !json {
+                println!("Prompt {prompt_len}, iteration {iteration}: {} tokens, prefill {:.6}s, decode {:.6}s, {:.2} end-to-end tok/s",sample.generated_tokens,sample.prefill_seconds,sample.decode_seconds,sample.tokens_per_second);
+            }
+            results.push(sample);
+        }
+        let statistics = serde_json::json!({
+            "elapsed_seconds":percentiles(results.iter().map(|r|r.elapsed_seconds).collect()),
+            "prefill_seconds":percentiles(results.iter().map(|r|r.prefill_seconds).collect()),
+            "decode_seconds":percentiles(results.iter().map(|r|r.decode_seconds).collect()),
+            "tokens_per_second":percentiles(results.iter().map(|r|r.tokens_per_second).collect()),
+            "decode_tokens_per_second":percentiles(results.iter().map(|r|r.decode_tokens_per_second).collect()),
+        });
+        let avg = results.iter().map(|r| r.tokens_per_second).sum::<f64>() / iterations as f64;
+        if !json {
+            println!("  latency p50/p95: {}", statistics["elapsed_seconds"]);
+        }
+        matrix.push(serde_json::json!({"prompt_len":prompt_len,"max_tokens":max_tokens,"average_tokens_per_second":avg,"statistics":statistics,"results":results}));
+    }
+    if json {
+        let mut tensor_types = std::collections::BTreeMap::<String, usize>::new();
+        if let Some(model) = &engine.model {
+            for tensor in &model.metadata.tensors {
+                *tensor_types
+                    .entry(tensor.data_type.to_string())
+                    .or_default() += 1;
             }
         }
-        let successful: Vec<f64> = results
-            .iter()
-            .filter_map(|result| result.get("tokens_per_second"))
-            .filter_map(serde_json::Value::as_f64)
-            .collect();
-        let average_tokens_per_second = if successful.is_empty() {
-            0.0
-        } else {
-            successful.iter().sum::<f64>() / successful.len() as f64
-        };
-        matrix.push(serde_json::json!({
-            "prompt_len": prompt_len,
-            "max_tokens": max_tokens,
-            "average_tokens_per_second": average_tokens_per_second,
-            "results": results,
-        }));
-    }
-
-    if json {
         println!(
             "{}",
             serde_json::json!({
-                "model": model_path,
-                "iterations": iterations,
-                "max_tokens": max_tokens,
-                "backend": engine.backend.name(),
-                "matrix": matrix,
+                "benchmark_schema_version":2,
+                "model":model_path,"model_sha256":model_sha256,"model_load_seconds":model_load_seconds,
+                "iterations":iterations,"warmup_iterations":warmup,"max_tokens":max_tokens,
+                "backend":engine.backend.name(),"cpu_matvec_thread_limit":cpu_threads.map(|c|c.0),
+                "cpu_matvec_kernel":cpu_threads.map(|c|c.1),
+                "backend_features":engine.backend.capabilities().features,
+                "kv_quant":engine.config.kv_quant.name(),
+                "runtime_weight_storage":"f32","gguf_tensor_types":tensor_types,
+                "sampling":{"temperature":0.0,"seed":42,"top_p":1.0,"top_k":0},
+                "kernel_launches":engine.backend.kernel_launches(),"resident_weight_bytes":engine.backend.resident_weight_bytes(),
+                "context_length":engine.config.max_seq_len,
+                "build_profile":if cfg!(debug_assertions){"debug"}else{"release"},
+                "input_kind":"synthetic-valid-token-ids","percentile_method":"nearest-rank",
+                "timing_semantics":"prefill includes session allocation; decode includes sampling, EOS checks and generation forwards; end-to-end excludes model loading; model_load is measured after hashing so filesystem cache may be warm; first_token is the first visible step return",
+                "matrix":matrix
             })
         );
     }
-
     Ok(())
 }
 
@@ -517,9 +720,11 @@ fn emit_golden_logits(
 ) -> Result<()> {
     let mut engine = InferenceEngine::new(Some(InferenceConfig::default()));
     engine.load_model(&model_path)?;
-    let tokenizer =
-        RuntimeTokenizer::from_metadata(engine.model.as_ref().map(|model| model.metadata()));
-    let tokens = tokenizer.encode(prompt);
+    let tokenizer = engine
+        .tokenizer
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Tokenizer not loaded"))?;
+    let tokens = tokenizer.try_encode(prompt).map_err(anyhow::Error::msg)?;
     let logits = engine
         .prefill(&tokens)
         .map_err(|err| anyhow::anyhow!("Prefill failed: {}", err))?;
@@ -666,7 +871,7 @@ async fn run_download(
         return Ok(());
     }
 
-    let output_path = download::models_dir(output_dir);
+    let output_path = output_dir.to_path_buf();
     fs::create_dir_all(&output_path).context("Failed to create models directory")?;
 
     if let Some(model_id) = model {
@@ -681,14 +886,17 @@ async fn run_download(
             }
         }
 
-        // Try as repo_id/filename format
+        // Preserve the owner/repository pair and any nested filename path.
         if model_id.contains('/') {
-            let parts: Vec<&str> = model_id.splitn(2, '/').collect();
-            if parts.len() == 2 {
-                let path = download::download_model(parts[0], parts[1], &output_path).await?;
-                println!("Downloaded to: {}", path.display());
-                return Ok(());
-            }
+            let parts: Vec<&str> = model_id.splitn(3, '/').collect();
+            anyhow::ensure!(
+                parts.len() == 3 && parts.iter().all(|part| !part.is_empty()),
+                "Model identifier must be owner/repository/filename"
+            );
+            let repo_id = format!("{}/{}", parts[0], parts[1]);
+            let path = download::download_model(&repo_id, parts[2], &output_path).await?;
+            println!("Downloaded to: {}", path.display());
+            return Ok(());
         }
 
         // Try as filename only - search in known repos

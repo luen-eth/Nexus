@@ -10,28 +10,20 @@ pub fn apply_rope(
     num_heads: usize,
     freq_base: f32,
 ) -> Vec<f32> {
-    let seq_len = positions.len();
-    let mut output = vec![0.0f32; seq_len * head_dim];
-
-    for (seq_idx, &pos) in positions.iter().enumerate() {
+    assert!(head_dim > 0 && head_dim.is_multiple_of(2) && num_heads > 0);
+    assert_eq!(tokens.len(), positions.len() * num_heads * head_dim);
+    let mut output = tokens.to_vec();
+    for (seq_idx, &position) in positions.iter().enumerate() {
         for head in 0..num_heads {
-            let head_start = head * head_dim / 2;
-            for d in 0..head_dim / 2 {
-                let dim_idx = head_start + d;
-                let inv_freq = (pos as f32) / freq_base.powf(2.0 * (d as f32) / (head_dim as f32));
-
-                let cos = inv_freq.cos();
-                let sin = inv_freq.sin();
-
-                let x0 = tokens[seq_idx * head_dim + dim_idx];
-                let x1 = tokens[seq_idx * head_dim + dim_idx + head_dim / 2];
-
-                output[seq_idx * head_dim + dim_idx] = x0 * cos - x1 * sin;
-                output[seq_idx * head_dim + dim_idx + head_dim / 2] = x0 * sin + x1 * cos;
-            }
+            let start = (seq_idx * num_heads + head) * head_dim;
+            rope_single(
+                &mut output[start..start + head_dim],
+                position,
+                head_dim,
+                freq_base,
+            );
         }
     }
-
     output
 }
 
@@ -262,11 +254,12 @@ pub fn rope_single(tokens: &mut [f32], position: usize, head_dim: usize, freq_ba
         let cos = inv_freq.cos();
         let sin = inv_freq.sin();
 
-        let x0 = tokens[d];
-        let x1 = tokens[d + head_dim / 2];
+        // LLaMA GGUF uses normal RoPE: adjacent coordinates, not split halves.
+        let x0 = tokens[2 * d];
+        let x1 = tokens[2 * d + 1];
 
-        tokens[d] = x0 * cos - x1 * sin;
-        tokens[d + head_dim / 2] = x0 * sin + x1 * cos;
+        tokens[2 * d] = x0 * cos - x1 * sin;
+        tokens[2 * d + 1] = x0 * sin + x1 * cos;
     }
 }
 
@@ -361,5 +354,17 @@ mod tests {
 
         let result = grouped_query_attention(&q, &k, &v, kv_seq_len, head_dim, num_kv_heads, scale);
         assert_eq!(result.len(), num_q_heads * head_dim);
+    }
+    #[test]
+    fn batched_rope_preserves_head_boundaries_and_uses_adjacent_pairs() {
+        let input = vec![
+            1., 2., 3., 4., 5., 6., 7., 8., 1., 2., 3., 4., 5., 6., 7., 8.,
+        ];
+        let output = apply_rope(&input, &[0, 1], 4, 2, 10000.);
+        assert_eq!(&output[..8], &input[..8]);
+        assert!((output[8] - (1f32.cos() - 2. * 1f32.sin())).abs() < 1e-6);
+        assert!((output[10] - (3. * 0.01f32.cos() - 4. * 0.01f32.sin())).abs() < 1e-6);
+        assert!((output[12] - (5. * 1f32.cos() - 6. * 1f32.sin())).abs() < 1e-6);
+        assert!((output[14] - (7. * 0.01f32.cos() - 8. * 0.01f32.sin())).abs() < 1e-6);
     }
 }

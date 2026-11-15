@@ -1,0 +1,18 @@
+Package: nexus-desktop
+Version: @VERSION@-@RELEASE@
+Section: science
+Priority: optional
+Architecture: all
+Maintainer: Nexus Contributors <noreply@users.noreply.github.com>
+Depends: python3 (>= 3.11), python3-pyside6.qtcore (>= 6.8), python3-pyside6.qtgui (>= 6.8), python3-pyside6.qtwidgets (>= 6.8), python3-pyside6.qtnetwork (>= 6.8), libqt6svg6, qt6-svg-plugins, qt6-qpa-plugins, fonts-dejavu-core
+Recommends: qt6-wayland
+Suggests: nexus-engine
+Homepage: https://github.com/luen-eth/Nexus
+Description: Desktop interface for local Nexus AI models
+ Select local GGUF models, manage an inference server, and inspect its status in a
+ native Qt desktop interface. No model weights or native engine binary are
+ included in this architecture-independent GUI package.
+ .
+ Requires distribution PySide6 packages, available in Debian 13 and Ubuntu
+ 26.04 universe. Install a separately compatible Nexus engine or connect to
+ an existing local server. This package is not an Arch Linux package.

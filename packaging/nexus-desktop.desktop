@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Nexus
+GenericName=Local AI Server Manager
+Comment=Manage a local Nexus AI server and GGUF models
+Comment[tr]=Yerel Nexus sunucusunu ve GGUF modellerini yönetin
+Exec=nexus-desktop
+TryExec=nexus-desktop
+Icon=nexus-desktop
+Terminal=false
+Categories=Utility;
+Keywords=AI;LLM;GGUF;server;local;
+StartupNotify=true
+StartupWMClass=nexus-desktop

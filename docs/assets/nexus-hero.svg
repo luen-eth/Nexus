@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="448" viewBox="0 0 1280 448" role="img" aria-labelledby="title desc">
+  <title id="title">Nexus — local inference in Rust</title>
+  <desc id="desc">A Rust GGUF runtime with a default CPU path using AVX2/FMA or scalar execution and an explicitly selected NVIDIA CUDA path. Both use F32 runtime weights.</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#101B18"/><stop offset="1" stop-color="#0E151E"/></linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#CFDFD9" stroke-opacity=".035"/></pattern>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1 1L7 4L1 7" fill="none" stroke="#72978B" stroke-width="1.5"/></marker>
+    <style>text{font-family:Inter,"DejaVu Sans",Arial,sans-serif}.mono{font-family:"DejaVu Sans Mono",monospace}.muted{fill:#A9BBB5}</style>
+  </defs>
+  <rect width="1280" height="448" rx="20" fill="url(#bg)"/>
+  <rect width="1280" height="448" rx="20" fill="url(#grid)"/>
+  <rect x="1" y="1" width="1278" height="446" rx="19" fill="none" stroke="#2F413B"/>
+  <path d="M64 76V46L88 76V46" fill="none" stroke="#BAED8A" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="108" y="68" font-size="14" letter-spacing="2.3" fill="#AFC3BA">RUST · GGUF · LOCAL INFERENCE</text>
+  <text x="60" y="188" font-size="92" font-weight="700" letter-spacing="-5" fill="#F2F7F3">Nexus</text>
+  <text x="66" y="242" font-size="26" fill="#DAE5DF">Local models. Explicit execution.</text>
+  <text x="66" y="278" font-size="19" class="muted">CPU by default. CUDA when selected.</text>
+  <rect x="66" y="314" width="108" height="31" rx="15.5" fill="#21382B" stroke="#4D6A43"/>
+  <circle cx="82" cy="329.5" r="4" fill="#BAED8A"/>
+  <text x="94" y="335" font-size="13" fill="#D4EFC2">Prototype</text>
+  <text x="192" y="335" font-size="14" class="muted">F32 runtime weights · Apache-2.0</text>
+  <text x="66" y="399" font-size="15" fill="#93ADA2">CLI</text><circle cx="107" cy="394" r="2" fill="#566F64"/>
+  <text x="123" y="399" font-size="15" fill="#93ADA2">OpenAI-compatible HTTP API</text><circle cx="370" cy="394" r="2" fill="#566F64"/>
+  <text x="386" y="399" font-size="15" fill="#93ADA2">Model conversion</text>
+  <path d="M644 224H736V142H791M736 224V306H791" fill="none" stroke="#72978B" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M736 224V142H791" fill="none" stroke="#72978B" stroke-width="2" marker-end="url(#arrow)"/>
+  <circle cx="644" cy="224" r="5" fill="#BAED8A"/><circle cx="736" cy="224" r="4" fill="#101B18" stroke="#72978B" stroke-width="2"/>
+  <rect x="801" y="78" width="415" height="128" rx="14" fill="#182B24" stroke="#476B4D"/>
+  <rect x="824" y="101" width="49" height="49" rx="10" fill="#263D2B"/>
+  <rect x="838" y="115" width="21" height="21" rx="3" fill="none" stroke="#BAED8A" stroke-width="2"/>
+  <path d="M841 110V115M848 110V115M855 110V115M841 136V141M848 136V141M855 136V141M833 118H838M833 125H838M833 132H838M859 118H864M859 125H864M859 132H864" stroke="#BAED8A" stroke-width="1.5"/>
+  <text x="890" y="124" fill="#DDF2D5" font-size="24" font-weight="700">CPU</text>
+  <text x="890" y="151" fill="#B5D3B3" font-size="16">AVX2 / FMA + scalar fallback</text>
+  <text x="824" y="182" fill="#9DB5A5" font-size="14">Portable default · optional thread control</text>
+  <rect x="801" y="242" width="415" height="128" rx="14" fill="#172635" stroke="#3E5A78"/>
+  <rect x="824" y="265" width="49" height="49" rx="10" fill="#22384E"/>
+  <path d="M836 278H862V299H836Z M840 283H858M840 289H851M840 295H858" fill="none" stroke="#93BEFF" stroke-width="2" stroke-linecap="round"/>
+  <text x="890" y="288" fill="#E0EBFF" font-size="24" font-weight="700">NVIDIA CUDA</text>
+  <text x="890" y="315" fill="#B5CBE8" font-size="16">Device-resident F32 projections</text>
+  <text x="824" y="346" fill="#9CAFC6" font-size="14">Explicit selection · hybrid CPU/GPU runtime</text>
+  <text x="805" y="410" fill="#718A80" font-size="12" letter-spacing="1.3">ONE MODEL RUNTIME / TWO PROJECTION BACKENDS</text>
+</svg>

@@ -1,13 +1,40 @@
 //! GGUF (GPT-Generated Unified Format) parser and writer
-//! Supports all GGUF versions and quantization types.
+//! GGUF v2/v3 little-endian metadata, checked tensor layout and selected weight codecs.
 
 #![allow(non_camel_case_types)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn zeroed_bytes(len: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| invalid("GGUF allocation exceeds available memory"))?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
+/// Bounds metadata parsing independently of the model payload size.
+const MAX_HEADER_BYTES: u64 = 128 * 1024 * 1024;
+struct CountingReader<'a> {
+    inner: io::Take<&'a mut dyn Read>,
+    position: u64,
+}
+impl Read for CountingReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.position += n as u64;
+        Ok(n)
+    }
+}
 
 // GGUF magic number and versions
 pub const GGUF_MAGIC: u32 = 0x46554747; // "GGUF"
@@ -55,248 +82,191 @@ impl GgufByteOrder {
     }
 }
 
-/// GGUF tensor data types (matches llama.cpp ggml_type)
+/// Stable GGML IDs and exact block geometry (ggml fc2b0053, April 2026).
+/// Recognition does not imply an implemented decoder. Removed/reserved IDs are rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum GgufDataType {
-    F32,
-    F16,
-    Q4_0,
-    Q4_1,
-    Q5_0,
-    Q5_1,
-    Q8_0,
-    Q8_1,
-    I8,
-    I16,
-    I32,
-    I64,
-    F64,
-    Q2_K,
-    Q3_K,
-    Q4_K,
-    Q5_K,
-    Q6_K,
-    Q8_K,
-    IQ2_XXS,
-    IQ2_XS,
-    Q2_S,
-    IQ1_S,
-    IQ1_N,
-    IQ4_NL,
-    IQ4_XS,
-    IQ3_XXS,
-    IQ3_S,
-    IQ2_S,
-    Q9_K,
-    I8x4,
-    I8x8,
-    F4E2M1,
-    F4E2M1x2,
-    F8E4M3,
-    F8E4M3x2,
-    F8E5M2,
-    F8E5M2x2,
-    BF16,
-    Q4_0_4x4,
-    Q4_0_8x8,
-    TF32,
+    F32 = 0,
+    F16 = 1,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    Q5_0 = 6,
+    Q5_1 = 7,
+    Q8_0 = 8,
+    Q8_1 = 9,
+    Q2_K = 10,
+    Q3_K = 11,
+    Q4_K = 12,
+    Q5_K = 13,
+    Q6_K = 14,
+    Q8_K = 15,
+    IQ2_XXS = 16,
+    IQ2_XS = 17,
+    IQ3_XXS = 18,
+    IQ1_S = 19,
+    IQ4_NL = 20,
+    IQ3_S = 21,
+    IQ2_S = 22,
+    IQ4_XS = 23,
+    I8 = 24,
+    I16 = 25,
+    I32 = 26,
+    I64 = 27,
+    F64 = 28,
+    IQ1_M = 29,
+    BF16 = 30,
+    TQ1_0 = 34,
+    TQ2_0 = 35,
+    MXFP4 = 39,
+    NVFP4 = 40,
+    Q1_0 = 41,
 }
 
 impl GgufDataType {
     pub fn id(&self) -> u32 {
-        match self {
-            GgufDataType::F32 => 0,
-            GgufDataType::F16 => 1,
-            GgufDataType::Q4_0 => 2,
-            GgufDataType::Q4_1 => 3,
-            GgufDataType::Q5_0 => 6,
-            GgufDataType::Q5_1 => 7,
-            GgufDataType::Q8_0 => 8,
-            GgufDataType::Q8_1 => 9,
-            GgufDataType::Q2_K => 10,
-            GgufDataType::Q3_K => 11,
-            GgufDataType::Q4_K => 12,
-            GgufDataType::Q5_K => 13,
-            GgufDataType::Q6_K => 14,
-            GgufDataType::Q8_K => 15,
-            GgufDataType::I8 => 16,
-            GgufDataType::I16 => 17,
-            GgufDataType::I32 => 18,
-            GgufDataType::I64 => 19,
-            GgufDataType::F64 => 20,
-            GgufDataType::IQ2_XXS => 21,
-            GgufDataType::IQ2_XS => 22,
-            GgufDataType::Q2_S => 23,
-            GgufDataType::IQ3_XXS => 24,
-            GgufDataType::IQ1_S => 25,
-            GgufDataType::IQ4_NL => 26,
-            GgufDataType::IQ3_S => 27,
-            GgufDataType::BF16 => 28,
-            GgufDataType::IQ4_XS => 30,
-            GgufDataType::IQ1_N => 31,
-            GgufDataType::IQ2_S => 34,
-            GgufDataType::Q4_0_4x4 => 36,
-            GgufDataType::Q4_0_8x8 => 37,
-            GgufDataType::Q9_K => 38,
-            GgufDataType::I8x4 => 39,
-            GgufDataType::I8x8 => 40,
-            GgufDataType::F4E2M1 => 41,
-            GgufDataType::F4E2M1x2 => 42,
-            GgufDataType::F8E4M3 => 43,
-            GgufDataType::F8E4M3x2 => 44,
-            GgufDataType::F8E5M2 => 45,
-            GgufDataType::F8E5M2x2 => 46,
-            GgufDataType::TF32 => 47,
-        }
+        *self as u32
     }
-
-    pub fn from_id(id: u32) -> Option<GgufDataType> {
+    pub fn from_id(id: u32) -> Option<Self> {
         match id {
-            0 => Some(GgufDataType::F32),
-            1 => Some(GgufDataType::F16),
-            2 => Some(GgufDataType::Q4_0),
-            3 => Some(GgufDataType::Q4_1),
-            6 => Some(GgufDataType::Q5_0),
-            7 => Some(GgufDataType::Q5_1),
-            8 => Some(GgufDataType::Q8_0),
-            9 => Some(GgufDataType::Q8_1),
-            10 => Some(GgufDataType::Q2_K),
-            11 => Some(GgufDataType::Q3_K),
-            12 => Some(GgufDataType::Q4_K),
-            13 => Some(GgufDataType::Q5_K),
-            14 => Some(GgufDataType::Q6_K),
-            15 => Some(GgufDataType::Q8_K),
-            16 => Some(GgufDataType::I8),
-            17 => Some(GgufDataType::I16),
-            18 => Some(GgufDataType::I32),
-            19 => Some(GgufDataType::I64),
-            20 => Some(GgufDataType::F64),
-            21 => Some(GgufDataType::IQ2_XXS),
-            22 => Some(GgufDataType::IQ2_XS),
-            23 => Some(GgufDataType::Q2_S),
-            24 => Some(GgufDataType::IQ3_XXS),
-            25 => Some(GgufDataType::IQ1_S),
-            26 => Some(GgufDataType::IQ4_NL),
-            27 => Some(GgufDataType::IQ3_S),
-            28 => Some(GgufDataType::BF16),
-            30 => Some(GgufDataType::IQ4_XS),
-            31 => Some(GgufDataType::IQ1_N),
-            34 => Some(GgufDataType::IQ2_S),
-            36 => Some(GgufDataType::Q4_0_4x4),
-            37 => Some(GgufDataType::Q4_0_8x8),
-            38 => Some(GgufDataType::Q9_K),
-            39 => Some(GgufDataType::I8x4),
-            40 => Some(GgufDataType::I8x8),
-            41 => Some(GgufDataType::F4E2M1),
-            42 => Some(GgufDataType::F4E2M1x2),
-            43 => Some(GgufDataType::F8E4M3),
-            44 => Some(GgufDataType::F8E4M3x2),
-            45 => Some(GgufDataType::F8E5M2),
-            46 => Some(GgufDataType::F8E5M2x2),
-            47 => Some(GgufDataType::TF32),
+            0 => Some(Self::F32),
+            1 => Some(Self::F16),
+            2 => Some(Self::Q4_0),
+            3 => Some(Self::Q4_1),
+            6 => Some(Self::Q5_0),
+            7 => Some(Self::Q5_1),
+            8 => Some(Self::Q8_0),
+            9 => Some(Self::Q8_1),
+            10 => Some(Self::Q2_K),
+            11 => Some(Self::Q3_K),
+            12 => Some(Self::Q4_K),
+            13 => Some(Self::Q5_K),
+            14 => Some(Self::Q6_K),
+            15 => Some(Self::Q8_K),
+            16 => Some(Self::IQ2_XXS),
+            17 => Some(Self::IQ2_XS),
+            18 => Some(Self::IQ3_XXS),
+            19 => Some(Self::IQ1_S),
+            20 => Some(Self::IQ4_NL),
+            21 => Some(Self::IQ3_S),
+            22 => Some(Self::IQ2_S),
+            23 => Some(Self::IQ4_XS),
+            24 => Some(Self::I8),
+            25 => Some(Self::I16),
+            26 => Some(Self::I32),
+            27 => Some(Self::I64),
+            28 => Some(Self::F64),
+            29 => Some(Self::IQ1_M),
+            30 => Some(Self::BF16),
+            34 => Some(Self::TQ1_0),
+            35 => Some(Self::TQ2_0),
+            39 => Some(Self::MXFP4),
+            40 => Some(Self::NVFP4),
+            41 => Some(Self::Q1_0),
             _ => None,
         }
     }
-
     pub fn name(&self) -> &'static str {
         match self {
-            GgufDataType::F32 => "F32",
-            GgufDataType::F16 => "F16",
-            GgufDataType::Q4_0 => "Q4_0",
-            GgufDataType::Q4_1 => "Q4_1",
-            GgufDataType::Q5_0 => "Q5_0",
-            GgufDataType::Q5_1 => "Q5_1",
-            GgufDataType::Q8_0 => "Q8_0",
-            GgufDataType::Q8_1 => "Q8_1",
-            GgufDataType::I8 => "I8",
-            GgufDataType::I16 => "I16",
-            GgufDataType::I32 => "I32",
-            GgufDataType::I64 => "I64",
-            GgufDataType::F64 => "F64",
-            GgufDataType::Q9_K => "Q9_K",
-            GgufDataType::Q2_K => "Q2_K",
-            GgufDataType::Q3_K => "Q3_K",
-            GgufDataType::Q4_K => "Q4_K",
-            GgufDataType::Q5_K => "Q5_K",
-            GgufDataType::Q6_K => "Q6_K",
-            GgufDataType::IQ2_XXS => "IQ2_XXS",
-            GgufDataType::IQ2_XS => "IQ2_XS",
-            GgufDataType::Q2_S => "Q2_S",
-            GgufDataType::I8x4 => "I8x4",
-            GgufDataType::I8x8 => "I8x8",
-            GgufDataType::F4E2M1 => "F4E2M1",
-            GgufDataType::BF16 => "BF16",
-            GgufDataType::Q4_0_4x4 => "Q4_0_4x4",
-            GgufDataType::Q4_0_8x8 => "Q4_0_8x8",
-            GgufDataType::TF32 => "TF32",
-            GgufDataType::Q8_K => "Q8_K",
-            GgufDataType::IQ1_S => "IQ1_S",
-            GgufDataType::IQ1_N => "IQ1_N",
-            GgufDataType::IQ3_XXS => "IQ3_XXS",
-            GgufDataType::IQ3_S => "IQ3_S",
-            GgufDataType::IQ2_S => "IQ2_S",
-            GgufDataType::IQ4_NL => "IQ4_NL",
-            GgufDataType::IQ4_XS => "IQ4_XS",
-            GgufDataType::F8E4M3 => "F8E4M3",
-            GgufDataType::F8E4M3x2 => "F8E4M3x2",
-            GgufDataType::F8E5M2 => "F8E5M2",
-            GgufDataType::F8E5M2x2 => "F8E5M2x2",
-            GgufDataType::F4E2M1x2 => "F4E2M1x2",
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::Q4_0 => "Q4_0",
+            Self::Q4_1 => "Q4_1",
+            Self::Q5_0 => "Q5_0",
+            Self::Q5_1 => "Q5_1",
+            Self::Q8_0 => "Q8_0",
+            Self::Q8_1 => "Q8_1",
+            Self::Q2_K => "Q2_K",
+            Self::Q3_K => "Q3_K",
+            Self::Q4_K => "Q4_K",
+            Self::Q5_K => "Q5_K",
+            Self::Q6_K => "Q6_K",
+            Self::Q8_K => "Q8_K",
+            Self::IQ2_XXS => "IQ2_XXS",
+            Self::IQ2_XS => "IQ2_XS",
+            Self::IQ3_XXS => "IQ3_XXS",
+            Self::IQ1_S => "IQ1_S",
+            Self::IQ4_NL => "IQ4_NL",
+            Self::IQ3_S => "IQ3_S",
+            Self::IQ2_S => "IQ2_S",
+            Self::IQ4_XS => "IQ4_XS",
+            Self::I8 => "I8",
+            Self::I16 => "I16",
+            Self::I32 => "I32",
+            Self::I64 => "I64",
+            Self::F64 => "F64",
+            Self::IQ1_M => "IQ1_M",
+            Self::BF16 => "BF16",
+            Self::TQ1_0 => "TQ1_0",
+            Self::TQ2_0 => "TQ2_0",
+            Self::MXFP4 => "MXFP4",
+            Self::NVFP4 => "NVFP4",
+            Self::Q1_0 => "Q1_0",
         }
     }
-
-    /// Returns bytes per element for this data type (approximate for quantized types)
+    /// Number of elements and bytes in one on-disk block.
+    pub fn block_layout(&self) -> (usize, usize) {
+        match self {
+            Self::F32 => (1, 4),
+            Self::F16 => (1, 2),
+            Self::Q4_0 => (32, 18),
+            Self::Q4_1 => (32, 20),
+            Self::Q5_0 => (32, 22),
+            Self::Q5_1 => (32, 24),
+            Self::Q8_0 => (32, 34),
+            Self::Q8_1 => (32, 36),
+            Self::Q2_K => (256, 84),
+            Self::Q3_K => (256, 110),
+            Self::Q4_K => (256, 144),
+            Self::Q5_K => (256, 176),
+            Self::Q6_K => (256, 210),
+            Self::Q8_K => (256, 292),
+            Self::IQ2_XXS => (256, 66),
+            Self::IQ2_XS => (256, 74),
+            Self::IQ3_XXS => (256, 98),
+            Self::IQ1_S => (256, 50),
+            Self::IQ4_NL => (32, 18),
+            Self::IQ3_S => (256, 110),
+            Self::IQ2_S => (256, 82),
+            Self::IQ4_XS => (256, 136),
+            Self::I8 => (1, 1),
+            Self::I16 => (1, 2),
+            Self::I32 => (1, 4),
+            Self::I64 => (1, 8),
+            Self::F64 => (1, 8),
+            Self::IQ1_M => (256, 56),
+            Self::BF16 => (1, 2),
+            Self::TQ1_0 => (256, 54),
+            Self::TQ2_0 => (256, 66),
+            Self::MXFP4 => (32, 17),
+            Self::NVFP4 => (64, 36),
+            Self::Q1_0 => (128, 18),
+        }
+    }
+    pub fn decode_supported(&self) -> bool {
+        matches!(
+            self,
+            Self::F32 | Self::F16 | Self::BF16 | Self::Q8_0 | Self::Q4_0 | Self::Q4_K | Self::Q2_K
+        )
+    }
+    /// Size of padded blocks; tensor rows must additionally satisfy block divisibility.
+    pub fn checked_data_size(&self, elements: usize) -> io::Result<usize> {
+        let (block, size) = self.block_layout();
+        elements
+            .div_ceil(block)
+            .checked_mul(size)
+            .ok_or_else(|| invalid("GGUF tensor byte size overflow"))
+    }
+    /// Compatibility helper: invalid sizes saturate; use checked_data_size for untrusted input.
     pub fn bytes_per_element(&self, elements: usize) -> usize {
-        fn blocks(elements: usize, block: usize, type_size: usize) -> usize {
-            elements.div_ceil(block) * type_size
-        }
-
-        match self {
-            GgufDataType::F32 | GgufDataType::TF32 => elements * 4,
-            GgufDataType::F16 | GgufDataType::BF16 => elements * 2,
-            GgufDataType::I8 => elements,
-            GgufDataType::I16 => elements * 2,
-            GgufDataType::I32 => elements * 4,
-            GgufDataType::I64 => elements * 8,
-            GgufDataType::F64 => elements * 8,
-            GgufDataType::Q4_0 | GgufDataType::Q4_0_4x4 | GgufDataType::Q4_0_8x8 => {
-                blocks(elements, 32, 18)
-            }
-            GgufDataType::Q4_1 => blocks(elements, 32, 20),
-            GgufDataType::Q5_0 => blocks(elements, 32, 22),
-            GgufDataType::Q5_1 => blocks(elements, 32, 24),
-            GgufDataType::Q8_0 => blocks(elements, 32, 34),
-            GgufDataType::Q8_1 => blocks(elements, 32, 36),
-            GgufDataType::Q2_K => blocks(elements, 256, 84),
-            GgufDataType::Q3_K => blocks(elements, 256, 110),
-            GgufDataType::Q4_K => blocks(elements, 256, 144),
-            GgufDataType::Q5_K => blocks(elements, 256, 176),
-            GgufDataType::Q6_K => blocks(elements, 256, 210),
-            GgufDataType::Q8_K => blocks(elements, 256, 292),
-            GgufDataType::Q9_K => blocks(elements, 256, 324),
-            GgufDataType::IQ1_S | GgufDataType::IQ1_N => blocks(elements, 256, 32),
-            GgufDataType::IQ2_XXS
-            | GgufDataType::IQ2_XS
-            | GgufDataType::IQ2_S
-            | GgufDataType::Q2_S => blocks(elements, 256, 64),
-            GgufDataType::IQ3_XXS | GgufDataType::IQ3_S => blocks(elements, 256, 96),
-            GgufDataType::IQ4_NL
-            | GgufDataType::IQ4_XS
-            | GgufDataType::F4E2M1
-            | GgufDataType::F4E2M1x2 => elements.div_ceil(2),
-            GgufDataType::F8E4M3
-            | GgufDataType::F8E4M3x2
-            | GgufDataType::F8E5M2
-            | GgufDataType::F8E5M2x2 => elements,
-            GgufDataType::I8x4 | GgufDataType::I8x8 => elements,
-        }
+        self.checked_data_size(elements).unwrap_or(usize::MAX)
     }
-
     pub fn elem_size(&self) -> usize {
-        match self {
-            GgufDataType::F32 | GgufDataType::TF32 => 4,
-            GgufDataType::F16 | GgufDataType::BF16 => 2,
-            _ => 0, // quantized types use block-based sizing
+        let (block, size) = self.block_layout();
+        if block == 1 {
+            size
+        } else {
+            0
         }
     }
 }
@@ -365,7 +335,7 @@ impl GgufValueType {
 }
 
 /// GGUF metadata value (holds any supported type)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GgufValue {
     Bool(bool),
     U8(u8),
@@ -384,6 +354,11 @@ pub enum GgufValue {
     U64Vec(Vec<u64>),
     F32Vec(Vec<f32>),
     StringVec(Vec<String>),
+    I8Vec(Vec<i8>),
+    U16Vec(Vec<u16>),
+    I16Vec(Vec<i16>),
+    I64Vec(Vec<i64>),
+    F64Vec(Vec<f64>),
 }
 
 impl GgufValue {
@@ -470,12 +445,36 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
-    pub fn num_elements(&self) -> usize {
-        self.shape.iter().map(|s| *s as usize).product()
+    pub fn checked_num_elements(&self) -> io::Result<usize> {
+        if self.shape.is_empty() || self.shape.len() > 4 || self.n_dims as usize != self.shape.len()
+        {
+            return Err(invalid("GGUF tensor dimensions must be 1..=4"));
+        }
+        self.shape.iter().try_fold(1usize, |n, &d| {
+            let d = usize::try_from(d).map_err(|_| invalid("Tensor dimension overflow"))?;
+            if d == 0 {
+                return Err(invalid("Zero tensor dimension"));
+            }
+            n.checked_mul(d)
+                .filter(|n| *n <= isize::MAX as usize)
+                .ok_or_else(|| invalid("Tensor element count overflow"))
+        })
     }
-
+    pub fn checked_data_size(&self) -> io::Result<usize> {
+        let n = self.checked_num_elements()?;
+        let (block, _) = self.data_type.block_layout();
+        if !self.shape[0].is_multiple_of(block as u64) {
+            return Err(invalid(
+                "GGUF tensor row is not divisible by codec block size",
+            ));
+        }
+        self.data_type.checked_data_size(n)
+    }
+    pub fn num_elements(&self) -> usize {
+        self.checked_num_elements().unwrap_or(usize::MAX)
+    }
     pub fn data_size(&self) -> usize {
-        self.data_type.bytes_per_element(self.num_elements())
+        self.checked_data_size().unwrap_or(usize::MAX)
     }
 }
 
@@ -567,7 +566,7 @@ impl ModelMetadata {
 
     /// Get rope frequency base
     pub fn rope_freq_base(&self) -> f32 {
-        self.get_f32("llama.rope.freq_base").unwrap_or(1000000.0)
+        self.get_f32("llama.rope.freq_base").unwrap_or(10000.0)
     }
 
     /// Get quantization format of weights
@@ -586,9 +585,50 @@ impl ModelMetadata {
         self.tensors.iter().find(|t| t.name == name)
     }
 
+    /// Validate before allocation/decoding, including calls supplied with hand-built metadata.
+    pub fn validate_tensor_layout(&self, file_len: u64) -> io::Result<()> {
+        if self.alignment == 0 || !self.alignment.is_power_of_two() || self.alignment > 1024 * 1024
+        {
+            return Err(invalid("Invalid GGUF alignment"));
+        }
+        if self.tensor_count != self.tensors.len() as u64 {
+            return Err(invalid("Tensor count mismatch"));
+        }
+        let mut names = HashSet::new();
+        let mut ranges = Vec::with_capacity(self.tensors.len());
+        for tensor in &self.tensors {
+            if tensor.name.is_empty() || !names.insert(tensor.name.as_str()) {
+                return Err(invalid("Duplicate/empty GGUF tensor name"));
+            }
+            if !tensor.offset.is_multiple_of(self.alignment as u64) {
+                return Err(invalid("Unaligned GGUF tensor offset"));
+            }
+            let size = tensor.checked_data_size()? as u64;
+            let start = self
+                .tensor_data_offset
+                .checked_add(tensor.offset)
+                .ok_or_else(|| invalid("Tensor offset overflow"))?;
+            let end = start
+                .checked_add(size)
+                .ok_or_else(|| invalid("Tensor range overflow"))?;
+            if end > file_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Tensor payload exceeds file",
+                ));
+            }
+            ranges.push((start, end));
+        }
+        ranges.sort_unstable();
+        if ranges.windows(2).any(|w| w[0].1 > w[1].0) {
+            return Err(invalid("Overlapping GGUF tensor payloads"));
+        }
+        Ok(())
+    }
+
     /// Absolute byte offset of a tensor's data in the GGUF file.
     pub fn absolute_tensor_offset(&self, tensor: &TensorInfo) -> u64 {
-        self.tensor_data_offset + tensor.offset
+        self.tensor_data_offset.saturating_add(tensor.offset)
     }
 }
 
@@ -600,11 +640,13 @@ pub struct GgufReader {
     tensors: Vec<TensorInfo>,
     tensor_count: u64,
     kv_count: u64,
+    data_offset: u64,
 }
 
 impl GgufReader {
     pub fn new() -> Self {
         GgufReader {
+            data_offset: 0,
             byte_order: GgufByteOrder::LittleEndian,
             version: 0,
             metadata: HashMap::new(),
@@ -637,7 +679,12 @@ impl GgufReader {
 
         // Read KV count
         self.kv_count = self.byte_order.read_u64(reader)?;
-
+        if self.tensor_count > 1_000_000 || self.kv_count > 100_000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GGUF table count exceeds limits",
+            ));
+        }
         Ok(())
     }
 
@@ -645,7 +692,13 @@ impl GgufReader {
     pub fn read_metadata(&mut self, reader: &mut dyn Read) -> io::Result<()> {
         for _ in 0..self.kv_count {
             let key_len = self.byte_order.read_u64(reader)?;
-            let mut key_bytes = vec![0u8; key_len as usize];
+            if key_len == 0 || key_len > 65535 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "GGUF key exceeds limit",
+                ));
+            }
+            let mut key_bytes = zeroed_bytes(key_len as usize)?;
             reader.read_exact(&mut key_bytes)?;
             let key = String::from_utf8(key_bytes)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -659,7 +712,9 @@ impl GgufReader {
             })?;
 
             let value = Self::read_value(reader, value_type, &self.byte_order)?;
-            self.metadata.insert(key, value);
+            if self.metadata.insert(key, value).is_some() {
+                return Err(invalid("Duplicate GGUF metadata key"));
+            }
         }
 
         Ok(())
@@ -670,7 +725,13 @@ impl GgufReader {
         for _ in 0..self.tensor_count {
             // Read name length and name
             let name_len = self.byte_order.read_u64(reader)?;
-            let mut name_bytes = vec![0u8; name_len as usize];
+            if name_len == 0 || name_len > 64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "GGUF tensor name exceeds limit",
+                ));
+            }
+            let mut name_bytes = zeroed_bytes(name_len as usize)?;
             reader.read_exact(&mut name_bytes)?;
             let name = String::from_utf8(name_bytes)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -679,6 +740,12 @@ impl GgufReader {
             let n_dims = self.byte_order.read_u32(reader)?;
 
             // Read shape
+            if n_dims == 0 || n_dims > 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "GGUF tensor dimensions must be 1..=4",
+                ));
+            }
             let mut shape = Vec::with_capacity(n_dims as usize);
             for _ in 0..n_dims {
                 let dim = self.byte_order.read_u64(reader)?;
@@ -719,6 +786,9 @@ impl GgufReader {
             GgufValueType::Bool => {
                 let mut byte = [0u8; 1];
                 reader.read_exact(&mut byte)?;
+                if byte[0] > 1 {
+                    return Err(invalid("Invalid GGUF boolean"));
+                }
                 Ok(GgufValue::Bool(byte[0] != 0))
             }
             GgufValueType::U8 => {
@@ -731,8 +801,16 @@ impl GgufReader {
                 reader.read_exact(&mut buf)?;
                 Ok(GgufValue::I8(buf[0] as i8))
             }
-            GgufValueType::U16 => Ok(GgufValue::U16(bo.read_u32(reader)? as u16)),
-            GgufValueType::I16 => Ok(GgufValue::I16(bo.read_u32(reader)? as i16)),
+            GgufValueType::U16 => {
+                let mut b = [0u8; 2];
+                reader.read_exact(&mut b)?;
+                Ok(GgufValue::U16(u16::from_le_bytes(b)))
+            }
+            GgufValueType::I16 => {
+                let mut b = [0u8; 2];
+                reader.read_exact(&mut b)?;
+                Ok(GgufValue::I16(i16::from_le_bytes(b)))
+            }
             GgufValueType::U32 => Ok(GgufValue::U32(bo.read_u32(reader)?)),
             GgufValueType::I32 => Ok(GgufValue::I32(bo.read_u32(reader)? as i32)),
             GgufValueType::F32 => {
@@ -749,7 +827,13 @@ impl GgufReader {
             }
             GgufValueType::String => {
                 let str_len = bo.read_u64(reader)?;
-                let mut str_bytes = vec![0u8; str_len as usize];
+                if str_len > 64 * 1024 * 1024 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "GGUF metadata string exceeds 64 MiB limit",
+                    ));
+                }
+                let mut str_bytes = zeroed_bytes(str_len as usize)?;
                 reader.read_exact(&mut str_bytes)?;
                 let s = String::from_utf8(str_bytes)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -761,16 +845,41 @@ impl GgufReader {
                     io::Error::new(io::ErrorKind::InvalidData, "Unknown array element type")
                 })?;
                 let arr_len = bo.read_u64(reader)?;
-
+                if arr_len > 1_000_000 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "GGUF metadata array exceeds item limit",
+                    ));
+                }
+                macro_rules! primitive_vec {
+                    ($scalar:ident, $vector:ident) => {{
+                        let mut values = Vec::with_capacity(arr_len as usize);
+                        for _ in 0..arr_len {
+                            if let GgufValue::$scalar(v) = Self::read_value(reader, arr_type, bo)? {
+                                values.push(v);
+                            }
+                        }
+                        Ok(GgufValue::$vector(values))
+                    }};
+                }
                 match arr_type {
+                    GgufValueType::U8 => primitive_vec!(U8, U8Vec),
+                    GgufValueType::I8 => primitive_vec!(I8, I8Vec),
+                    GgufValueType::U16 => primitive_vec!(U16, U16Vec),
+                    GgufValueType::I16 => primitive_vec!(I16, I16Vec),
+                    GgufValueType::I64 => primitive_vec!(I64, I64Vec),
+                    GgufValueType::F64 => primitive_vec!(F64, F64Vec),
                     GgufValueType::Bool => {
                         let mut vec = Vec::with_capacity(arr_len as usize);
                         for _ in 0..arr_len {
                             let mut b = [0u8; 1];
                             reader.read_exact(&mut b)?;
-                            vec.push(b[0] != 0);
+                            if b[0] > 1 {
+                                return Err(invalid("Invalid GGUF boolean"));
+                            }
+                            vec.push(b[0]);
                         }
-                        Ok(GgufValue::U8Vec(vec.iter().map(|&b| b as u8).collect()))
+                        Ok(GgufValue::U8Vec(vec))
                     }
                     GgufValueType::I32 => {
                         let mut vec = Vec::with_capacity(arr_len as usize);
@@ -779,6 +888,13 @@ impl GgufReader {
                             vec.push(val as i32);
                         }
                         Ok(GgufValue::I32Vec(vec))
+                    }
+                    GgufValueType::U32 => {
+                        let mut vec = Vec::with_capacity(arr_len as usize);
+                        for _ in 0..arr_len {
+                            vec.push(bo.read_u32(reader)? as u64);
+                        }
+                        Ok(GgufValue::U64Vec(vec))
                     }
                     GgufValueType::U64 => {
                         let mut vec = Vec::with_capacity(arr_len as usize);
@@ -800,7 +916,13 @@ impl GgufReader {
                         let mut vec = Vec::with_capacity(arr_len as usize);
                         for _ in 0..arr_len {
                             let str_len = bo.read_u64(reader)?;
-                            let mut str_bytes = vec![0u8; str_len as usize];
+                            if str_len > 64 * 1024 * 1024 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "GGUF metadata string exceeds 64 MiB limit",
+                                ));
+                            }
+                            let mut str_bytes = zeroed_bytes(str_len as usize)?;
                             reader.read_exact(&mut str_bytes)?;
                             let s = String::from_utf8(str_bytes)
                                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -808,10 +930,7 @@ impl GgufReader {
                         }
                         Ok(GgufValue::StringVec(vec))
                     }
-                    _ => Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "Array type not fully supported",
-                    )),
+                    GgufValueType::Array => Err(invalid("Nested GGUF arrays are not allowed")),
                 }
             }
         }
@@ -819,38 +938,46 @@ impl GgufReader {
 
     /// Full parse: reads header, metadata, and tensor info
     pub fn parse(&mut self, reader: &mut dyn Read) -> io::Result<ModelMetadata> {
-        self.read_header(reader)?;
-        self.read_metadata(reader)?;
-        self.read_tensors(reader)?;
-
-        Ok(ModelMetadata {
+        *self = Self::new();
+        let mut reader = CountingReader {
+            inner: reader.take(MAX_HEADER_BYTES),
+            position: 0,
+        };
+        self.read_header(&mut reader)?;
+        self.read_metadata(&mut reader)?;
+        self.read_tensors(&mut reader)?;
+        let alignment = match self.metadata.get("general.alignment") {
+            None => 32,
+            Some(GgufValue::U32(n)) => *n as usize,
+            _ => return Err(invalid("GGUF alignment must be U32")),
+        };
+        if alignment == 0 || !alignment.is_power_of_two() || alignment > 1024 * 1024 {
+            return Err(invalid("Invalid GGUF alignment"));
+        }
+        let tensor_data_offset = reader
+            .position
+            .checked_add(alignment as u64 - 1)
+            .map(|p| p / alignment as u64 * alignment as u64)
+            .ok_or_else(|| invalid("Header alignment overflow"))?;
+        let metadata = ModelMetadata {
             version: self.version,
             tensor_count: self.tensor_count,
             kv_count: self.kv_count,
             byte_order: self.byte_order,
-            alignment: self
-                .metadata
-                .get("general.alignment")
-                .and_then(|v| {
-                    v.as_u32()
-                        .map(|v| v as usize)
-                        .or_else(|| v.as_u64().map(|v| v as usize))
-                })
-                .unwrap_or(32),
-            tensor_data_offset: 0,
+            alignment,
+            tensor_data_offset,
             metadata: self.metadata.clone(),
             tensors: self.tensors.clone(),
-        })
+        };
+        self.data_offset = tensor_data_offset;
+        // Read-only streams have no file length. Still validate all descriptor arithmetic and overlap.
+        metadata.validate_tensor_layout(u64::MAX)?;
+        Ok(metadata)
     }
 
     /// Get tensor data offset from file
     pub fn tensor_data_offset(&self) -> u64 {
-        // The offset field in TensorInfo already accounts for alignment
-        if let Some(last_tensor) = self.tensors.last() {
-            last_tensor.offset + last_tensor.data_size() as u64
-        } else {
-            0
-        }
+        self.data_offset
     }
 
     pub fn tensor_count(&self) -> usize {
@@ -881,9 +1008,22 @@ impl GgufReader {
         tensor: &TensorInfo,
     ) -> io::Result<Vec<u8>> {
         let mut file = File::open(path)?;
-        file.seek(SeekFrom::Start(metadata.absolute_tensor_offset(tensor)))?;
-
-        let mut data = vec![0u8; tensor.data_size()];
+        let offset = metadata
+            .tensor_data_offset
+            .checked_add(tensor.offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Tensor offset overflow"))?;
+        let size = tensor.checked_data_size()?;
+        if offset
+            .checked_add(size as u64)
+            .is_none_or(|end| end > file.metadata().map(|m| m.len()).unwrap_or(0))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Tensor payload exceeds file",
+            ));
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut data = zeroed_bytes(size)?;
         file.read_exact(&mut data)?;
         Ok(data)
     }
@@ -895,7 +1035,7 @@ impl GgufReader {
         tensor: &TensorInfo,
     ) -> io::Result<Vec<f32>> {
         let data = Self::read_tensor_bytes(path, metadata, tensor)?;
-        Self::tensor_bytes_to_f32(tensor.data_type, tensor.num_elements(), &data)
+        Self::tensor_bytes_to_f32(tensor.data_type, tensor.checked_num_elements()?, &data)
     }
 
     /// Convert supported GGUF tensor payloads to f32.
@@ -904,6 +1044,22 @@ impl GgufReader {
         output_len: usize,
         data: &[u8],
     ) -> io::Result<Vec<f32>> {
+        if !data_type.decode_supported() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Dequantization for {data_type} is not implemented"),
+            ));
+        }
+        let needed = data_type.checked_data_size(output_len)?;
+        if data.len() < needed {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Tensor payload is truncated",
+            ));
+        }
+        if output_len == 0 {
+            return Ok(Vec::new());
+        }
         match data_type {
             GgufDataType::F32 => {
                 if data.len() < output_len * 4 {
@@ -913,7 +1069,9 @@ impl GgufReader {
                     ));
                 }
                 Ok(data
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .take(output_len)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect())
@@ -926,7 +1084,9 @@ impl GgufReader {
                     ));
                 }
                 Ok(data
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .take(output_len)
                     .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
                     .collect())
@@ -939,7 +1099,9 @@ impl GgufReader {
                     ));
                 }
                 Ok(data
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .take(output_len)
                     .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                     .collect())
@@ -971,7 +1133,7 @@ impl GgufReader {
         }
 
         let mut output = Vec::with_capacity(output_len);
-        for block in data.chunks_exact(BLOCK) {
+        for block in data.as_chunks::<BLOCK>().0 {
             let d = Self::decode_f16_le(&block[..2]);
             for &q in &block[2..] {
                 output.push((q as i8) as f32 * d);
@@ -996,7 +1158,7 @@ impl GgufReader {
         }
 
         let mut output = Vec::with_capacity(output_len);
-        for block in data.chunks_exact(BLOCK) {
+        for block in data.as_chunks::<BLOCK>().0 {
             let d = Self::decode_f16_le(&block[..2]);
             let qs = &block[2..];
 
@@ -1030,7 +1192,7 @@ impl GgufReader {
         }
 
         let mut output = Vec::with_capacity(output_len);
-        for block in data.chunks_exact(BLOCK) {
+        for block in data.as_chunks::<BLOCK>().0 {
             let d = Self::decode_f16_le(&block[..2]);
             let dmin = Self::decode_f16_le(&block[2..4]);
             let mut scales = [0u8; 8];
@@ -1039,12 +1201,8 @@ impl GgufReader {
             let qs = &block[16..];
 
             for i in 0..QK {
-                let packed = qs[i % (QK / 2)];
-                let q = if i < QK / 2 {
-                    packed & 0x0f
-                } else {
-                    packed >> 4
-                };
+                let packed = qs[(i / 64) * 32 + i % 32];
+                let q = (packed >> (4 * ((i / 32) % 2))) & 0x0f;
                 let sub = i / 32;
                 output.push(d * scales[sub] as f32 * q as f32 - dmin * mins[sub] as f32);
                 if output.len() == output_len {
@@ -1067,14 +1225,14 @@ impl GgufReader {
         }
 
         let mut output = Vec::with_capacity(output_len);
-        for block in data.chunks_exact(BLOCK) {
+        for block in data.as_chunks::<BLOCK>().0 {
             let scales = &block[..16];
             let qs = &block[16..80];
             let d = Self::decode_f16_le(&block[80..82]);
             let dmin = Self::decode_f16_le(&block[82..84]);
 
             for i in 0..QK {
-                let q = (qs[i / 4] >> ((i % 4) * 2)) & 0x03;
+                let q = (qs[(i / 128) * 32 + i % 32] >> (2 * ((i % 128) / 32))) & 0x03;
                 let packed = scales[i / 16];
                 let scale = (packed & 0x0f) as f32;
                 let min = (packed >> 4) as f32;
@@ -1089,452 +1247,9 @@ impl GgufReader {
 
     /// Parse GGUF from a byte slice (memory-mapped data)
     fn parse_from_bytes(&mut self, data: &[u8]) -> io::Result<ModelMetadata> {
-        let mut pos = 0usize;
-
-        // Validate magic
-        if data.len() < 8 || &data[0..4] != b"GGUF" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid GGUF magic",
-            ));
-        }
-        pos += 4;
-
-        // Read version
-        if data.len() < pos + 4 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Unexpected EOF reading version",
-            ));
-        }
-        let version = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-        pos += 4;
-
-        if version != GGUF_VERSION_2 && version != GGUF_VERSION_3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unsupported GGUF version: {}", version),
-            ));
-        }
-
-        // Read tensor count
-        if data.len() < pos + 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Unexpected EOF reading tensor count",
-            ));
-        }
-        let tensor_count = u64::from_le_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-            data[pos + 4],
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-        ]);
-        pos += 8;
-
-        // Read KV count
-        if data.len() < pos + 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Unexpected EOF reading kv count",
-            ));
-        }
-        let kv_count = u64::from_le_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-            data[pos + 4],
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-        ]);
-        pos += 8;
-
-        self.tensor_count = tensor_count;
-        self.kv_count = kv_count;
-        self.version = version;
-
-        // Read metadata
-        for _ in 0..kv_count {
-            if pos + 8 > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Unexpected EOF reading metadata key length",
-                ));
-            }
-            // GGUF: key length is always u64 (v2 and v3 both use u64 for keys)
-            let name_len: usize;
-            if version == GGUF_VERSION_3 {
-                // v3 uses u32 for tensor names but u64 for KV keys
-                name_len = u64::from_le_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                    data[pos + 4],
-                    data[pos + 5],
-                    data[pos + 6],
-                    data[pos + 7],
-                ]) as usize;
-                pos += 8;
-            } else {
-                name_len = u64::from_le_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                    data[pos + 4],
-                    data[pos + 5],
-                    data[pos + 6],
-                    data[pos + 7],
-                ]) as usize;
-                pos += 8;
-            };
-
-            if pos + name_len > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Key string exceeds file bounds",
-                ));
-            }
-            let key = std::str::from_utf8(&data[pos..pos + name_len])
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            pos += name_len;
-
-            if pos + 4 > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Unexpected EOF reading value type",
-                ));
-            }
-            let type_id =
-                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-            pos += 4;
-            let value_type = GgufValueType::from_id(type_id).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unknown value type: {}", type_id),
-                )
-            })?;
-
-            let (value, read_len) = Self::read_value_from_bytes(data, pos, value_type)?;
-            pos += read_len;
-            self.metadata.insert(key.to_string(), value);
-        }
-
-        // Read tensor info
-        for _ in 0..tensor_count {
-            if pos + 8 > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Unexpected EOF reading tensor name length",
-                ));
-            }
-            let name_len = u64::from_le_bytes([
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-                data[pos + 5],
-                data[pos + 6],
-                data[pos + 7],
-            ]) as usize;
-            pos += 8;
-
-            if pos + name_len > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Tensor name exceeds file bounds",
-                ));
-            }
-            let name = std::str::from_utf8(&data[pos..pos + name_len])
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            pos += name_len;
-
-            if pos + 4 > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Unexpected EOF reading dims",
-                ));
-            }
-            let n_dims =
-                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-            pos += 4;
-
-            let mut shape = Vec::with_capacity(n_dims as usize);
-            for _ in 0..n_dims {
-                if pos + 8 > data.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "Unexpected EOF reading shape",
-                    ));
-                }
-                let dim = u64::from_le_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                    data[pos + 4],
-                    data[pos + 5],
-                    data[pos + 6],
-                    data[pos + 7],
-                ]);
-                pos += 8;
-                shape.push(dim);
-            }
-
-            if pos + 4 > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Unexpected EOF reading data type",
-                ));
-            }
-            let data_type_id =
-                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-            pos += 4;
-            let data_type = GgufDataType::from_id(data_type_id).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unknown data type: {}", data_type_id),
-                )
-            })?;
-
-            if pos + 8 > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Unexpected EOF reading tensor offset",
-                ));
-            }
-            let tensor_offset = u64::from_le_bytes([
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-                data[pos + 5],
-                data[pos + 6],
-                data[pos + 7],
-            ]);
-            pos += 8;
-
-            self.tensors.push(TensorInfo {
-                name: name.to_string(),
-                n_dims,
-                shape,
-                data_type,
-                offset: tensor_offset,
-                stride: vec![1; n_dims as usize],
-            });
-        }
-
-        let alignment = self
-            .metadata
-            .get("general.alignment")
-            .and_then(|v| {
-                v.as_u32()
-                    .map(|v| v as usize)
-                    .or_else(|| v.as_u64().map(|v| v as usize))
-            })
-            .unwrap_or(32)
-            .max(1);
-        let tensor_data_offset = pos.div_ceil(alignment) * alignment;
-
-        Ok(ModelMetadata {
-            version,
-            tensor_count: self.tensor_count,
-            kv_count: self.kv_count,
-            byte_order: GgufByteOrder::LittleEndian,
-            alignment,
-            tensor_data_offset: tensor_data_offset as u64,
-            metadata: self.metadata.clone(),
-            tensors: self.tensors.clone(),
-        })
-    }
-
-    fn read_value_from_bytes(
-        data: &[u8],
-        pos: usize,
-        value_type: GgufValueType,
-    ) -> io::Result<(GgufValue, usize)> {
-        let mut pos = pos;
-        match value_type {
-            GgufValueType::Bool => {
-                let val = data[pos] != 0;
-                Ok((GgufValue::Bool(val), 1))
-            }
-            GgufValueType::U8 => {
-                let val = data[pos];
-                Ok((GgufValue::U8(val), 1))
-            }
-            GgufValueType::I8 => {
-                let val = data[pos] as i8;
-                Ok((GgufValue::I8(val), 1))
-            }
-            GgufValueType::U16 => {
-                let val = u16::from_le_bytes([data[pos], data[pos + 1]]);
-                Ok((GgufValue::U16(val), 2))
-            }
-            GgufValueType::I16 => {
-                let val = i16::from_le_bytes([data[pos], data[pos + 1]]);
-                Ok((GgufValue::I16(val), 2))
-            }
-            GgufValueType::U32 => {
-                let val =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-                Ok((GgufValue::U32(val), 4))
-            }
-            GgufValueType::I32 => {
-                let val =
-                    i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-                Ok((GgufValue::I32(val), 4))
-            }
-            GgufValueType::F32 => {
-                let val =
-                    f32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-                Ok((GgufValue::F32(val), 4))
-            }
-            GgufValueType::U64 => {
-                let val = u64::from_le_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                    data[pos + 4],
-                    data[pos + 5],
-                    data[pos + 6],
-                    data[pos + 7],
-                ]);
-                Ok((GgufValue::U64(val), 8))
-            }
-            GgufValueType::I64 => {
-                let val = i64::from_le_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                    data[pos + 4],
-                    data[pos + 5],
-                    data[pos + 6],
-                    data[pos + 7],
-                ]);
-                Ok((GgufValue::I64(val), 8))
-            }
-            GgufValueType::F64 => {
-                let val = f64::from_le_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                    data[pos + 4],
-                    data[pos + 5],
-                    data[pos + 6],
-                    data[pos + 7],
-                ]);
-                Ok((GgufValue::F64(val), 8))
-            }
-            GgufValueType::String => {
-                let str_len = u64::from_le_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                    data[pos + 4],
-                    data[pos + 5],
-                    data[pos + 6],
-                    data[pos + 7],
-                ]);
-                pos += 8;
-                let s = std::str::from_utf8(&data[pos..pos + str_len as usize])
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Ok((GgufValue::String(s.to_string()), 8 + str_len as usize))
-            }
-            GgufValueType::Array => {
-                let arr_type_id =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-                pos += 4;
-                let arr_type = GgufValueType::from_id(arr_type_id).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Unknown array type")
-                })?;
-                let arr_len = u64::from_le_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                    data[pos + 4],
-                    data[pos + 5],
-                    data[pos + 6],
-                    data[pos + 7],
-                ]);
-                pos += 8;
-
-                let mut read = 12usize;
-                match arr_type {
-                    GgufValueType::I32 => {
-                        let mut vec = Vec::with_capacity(arr_len as usize);
-                        for _ in 0..arr_len {
-                            let val = i32::from_le_bytes([
-                                data[pos],
-                                data[pos + 1],
-                                data[pos + 2],
-                                data[pos + 3],
-                            ]);
-                            vec.push(val);
-                            pos += 4;
-                            read += 4;
-                        }
-                        Ok((GgufValue::I32Vec(vec), read))
-                    }
-                    GgufValueType::F32 => {
-                        let mut vec = Vec::with_capacity(arr_len as usize);
-                        for _ in 0..arr_len {
-                            let val = f32::from_le_bytes([
-                                data[pos],
-                                data[pos + 1],
-                                data[pos + 2],
-                                data[pos + 3],
-                            ]);
-                            vec.push(val);
-                            pos += 4;
-                            read += 4;
-                        }
-                        Ok((GgufValue::F32Vec(vec), read))
-                    }
-                    GgufValueType::String => {
-                        let mut vec = Vec::with_capacity(arr_len as usize);
-                        for _ in 0..arr_len {
-                            let str_len = u64::from_le_bytes([
-                                data[pos],
-                                data[pos + 1],
-                                data[pos + 2],
-                                data[pos + 3],
-                                data[pos + 4],
-                                data[pos + 5],
-                                data[pos + 6],
-                                data[pos + 7],
-                            ]);
-                            pos += 8;
-                            let s = std::str::from_utf8(&data[pos..pos + str_len as usize])
-                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                            vec.push(s.to_string());
-                            pos += str_len as usize;
-                            read += 8 + str_len as usize;
-                        }
-                        Ok((GgufValue::StringVec(vec), read))
-                    }
-                    _ => {
-                        // Skip unknown array types
-                        let skip = 12 + (arr_len as usize) * 4;
-                        Ok((GgufValue::I32Vec(vec![]), skip))
-                    }
-                }
-            }
-        }
+        let metadata = self.parse(&mut io::Cursor::new(data))?;
+        metadata.validate_tensor_layout(data.len() as u64)?;
+        Ok(metadata)
     }
 }
 
@@ -1699,14 +1414,14 @@ mod tests {
         let data: Vec<f32> = (0..300).map(|i| i as f32 / 31.0 - 4.0).collect();
 
         let q4_engine = QuantEngine::new(QuantFormat::Q4_K, KvQuantType::None);
-        let q4 = q4_engine.quantize_weights(&data);
+        let q4 = q4_engine.quantize_weights(&data).unwrap();
         let q4_values =
             GgufReader::tensor_bytes_to_f32(GgufDataType::Q4_K, data.len(), &q4).unwrap();
         assert_eq!(q4.len(), data.len().div_ceil(256) * 144);
         assert_eq!(q4_values.len(), data.len());
 
         let q2_engine = QuantEngine::new(QuantFormat::Q2_K, KvQuantType::None);
-        let q2 = q2_engine.quantize_weights(&data);
+        let q2 = q2_engine.quantize_weights(&data).unwrap();
         let q2_values =
             GgufReader::tensor_bytes_to_f32(GgufDataType::Q2_K, data.len(), &q2).unwrap();
         assert_eq!(q2.len(), data.len().div_ceil(256) * 84);
@@ -1735,5 +1450,44 @@ mod tests {
     fn test_gguf_magic() {
         assert_eq!(GGUF_MAGIC, 0x46554747);
         assert_eq!(&GGUF_MAGIC.to_le_bytes(), b"GGUF");
+    }
+    #[test]
+    fn metadata_lengths_are_bounded_and_scalar_reads_are_exact() {
+        for is_array in [false, true] {
+            let mut bytes = b"GGUF".to_vec();
+            push_u32(&mut bytes, 3);
+            push_u64(&mut bytes, 0);
+            push_u64(&mut bytes, 1);
+            push_string(&mut bytes, "nexus.tokenizer.json");
+            push_u32(&mut bytes, if is_array { 9 } else { 8 });
+            if is_array {
+                push_u32(&mut bytes, 8);
+            }
+            push_u64(&mut bytes, u64::MAX);
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(&bytes).unwrap();
+            let result = std::panic::catch_unwind(|| GgufReader::parse_file(file.path()));
+            assert!(result.is_ok());
+            assert!(result.unwrap().is_err());
+        }
+        let mut bytes = b"GGUF".to_vec();
+        push_u32(&mut bytes, 3);
+        push_u64(&mut bytes, 0);
+        push_u64(&mut bytes, 2);
+        push_string(&mut bytes, "test.short");
+        push_u32(&mut bytes, 2);
+        bytes.extend_from_slice(&0x1234u16.to_le_bytes());
+        push_kv_string(&mut bytes, "general.name", "cursor stays aligned");
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        let metadata = GgufReader::parse_file(file.path()).unwrap();
+        assert!(matches!(
+            metadata.metadata["test.short"],
+            GgufValue::U16(0x1234)
+        ));
+        assert_eq!(
+            metadata.get_str("general.name"),
+            Some("cursor stays aligned")
+        );
     }
 }

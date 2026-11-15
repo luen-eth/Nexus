@@ -1,0 +1,108 @@
+name: Rust CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  dependency-audit:
+    name: RustSec dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install verified cargo-audit release
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.23.0/cargo-audit-x86_64-unknown-linux-gnu-v0.23.0.tgz \
+            --output cargo-audit.tgz
+          printf '%s  %s\n' b77993532b253fcbf550996d7716465ec3d734d4e74e7f87bfb65a19add0fb59 cargo-audit.tgz | sha256sum --check
+          tar -xzf cargo-audit.tgz
+          echo "$RUNNER_TEMP/cargo-audit-x86_64-unknown-linux-gnu-v0.23.0" >> "$GITHUB_PATH"
+      - name: Audit the locked dependency graph
+        run: cargo-audit audit --deny unsound
+  test:
+    name: ${{ matrix.os }} / Rust ${{ matrix.toolchain }} / ${{ matrix.features || 'default' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            toolchain: stable
+            features: ''
+          - os: ubuntu-latest
+            toolchain: '1.88.0'
+            features: ''
+          - os: ubuntu-latest
+            toolchain: stable
+            features: all-backends
+          - os: macos-latest
+            toolchain: stable
+            features: metal
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+      - name: Linux native prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends g++ cmake clang libclang-dev pkg-config libssl-dev
+      - name: macOS native prerequisites
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake llvm pkg-config
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - name: Format
+        # Keep style gates on stable; the MSRV entry checks compilation/tests.
+        if: matrix.toolchain == 'stable'
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        if: matrix.toolchain == 'stable'
+        env:
+          NEXUS_CI_FEATURES: ${{ matrix.features }}
+        run: |
+          if [ -n "$NEXUS_CI_FEATURES" ]; then
+            cargo clippy --locked --workspace --all-targets --features "$NEXUS_CI_FEATURES" -- -D warnings
+          else
+            cargo clippy --locked --workspace --all-targets -- -D warnings
+          fi
+      - name: Test
+        env:
+          NEXUS_CI_FEATURES: ${{ matrix.features }}
+        run: |
+          if [ -n "$NEXUS_CI_FEATURES" ]; then
+            cargo test --locked --workspace --features "$NEXUS_CI_FEATURES"
+          else
+            cargo test --locked --workspace
+          fi
+  desktop:
+    name: Linux desktop / Qt offscreen
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONPATH: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Qt runtime prerequisites
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libegl1 libgl1 libxkbcommon0
+      - name: Desktop dependencies
+        run: python -m pip install 'PySide6>=6.8,<7'
+      - name: CLI entry point
+        run: |
+          python -m nexus_desktop --help
+          python -m nexus_desktop --version
+      - name: GUI and controller regressions
+        run: python -m unittest discover -s desktop/tests -v
+      - name: Packaging contracts
+        run: python -m unittest discover -s packaging -p 'test_*.py' -v

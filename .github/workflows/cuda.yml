@@ -1,0 +1,25 @@
+name: CUDA hardware verification
+# Run only after a maintainer explicitly requests it. Never execute untrusted
+# pull requests automatically on a machine with a GPU/driver installation.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cuda:
+    runs-on: [self-hosted, linux, x64, cuda]
+    timeout-minutes: 30
+    env:
+      NEXUS_REQUIRE_CUDA: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Native build prerequisites
+        run: |
+          for tool in g++ cmake clang pkg-config; do command -v "$tool"; done
+          pkg-config --exists openssl
+          # The self-hosted CUDA image must provision libclang for bindgen.
+      - name: Driver and device
+        run: nvidia-smi
+      - name: CUDA numerical and lifecycle regression tests
+        run: cargo test --locked --features cuda --test cuda_execution --test backend_regressions -- --nocapture

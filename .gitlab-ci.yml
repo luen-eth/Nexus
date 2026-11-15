@@ -1,12 +1,15 @@
-image: rust:latest
+image: rust:1.88
 
 stages:
   - test
 
 check:
   stage: test
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends g++ cmake clang libclang-dev pkg-config libssl-dev
   script:
     - rustup component add rustfmt clippy
     - cargo fmt --all -- --check
-    - cargo clippy --workspace --all-targets -- -D warnings
-    - cargo test --workspace
+    - cargo clippy --locked --workspace --all-targets -- -D warnings
+    - cargo test --locked --workspace
