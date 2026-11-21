@@ -9,6 +9,7 @@ pub struct TinyModel {
     pub types: BTreeMap<String, u32>,
 }
 
+#[derive(Clone)]
 pub enum Value {
     Text(String),
     Uint(u32),

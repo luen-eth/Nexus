@@ -31,8 +31,8 @@ struct Cli {
     #[arg(long, default_value_t = 4096)]
     ctx_size: usize,
 
-    /// KV cache quantization type
-    #[arg(long, default_value = "tq_3b2b")]
+    /// KV cache quantization type; none keeps the reference float quality
+    #[arg(long, default_value = "none")]
     kv_quant: String,
 
     /// Runtime weight storage (f32 only). GGUF file codecs are detected automatically.
@@ -84,6 +84,14 @@ async fn main() -> Result<()> {
     // Parse configuration
     let kv_quant_type = KvQuantType::from_str(&cli.kv_quant.to_ascii_lowercase().replace('-', "_"))
         .ok_or_else(|| anyhow!("Unsupported KV quantization: {}", cli.kv_quant))?;
+    if kv_quant_type != KvQuantType::None {
+        // Every recorded validation and benchmark ran with unquantized KV.
+        // Make the quality trade-off visible instead of silent.
+        eprintln!(
+            "Warning: KV cache quantization '{}' is active; generated text differs from the unquantized reference.",
+            cli.kv_quant
+        );
+    }
     let weight_name = cli.weight_quant.to_ascii_uppercase().replace('-', "_");
     let weight_format = QuantFormat::from_str(if weight_name == "F32" {
         "FP32"
@@ -99,6 +107,14 @@ async fn main() -> Result<()> {
     let backend_type = parse_backend(&cli.backend).map_err(|err| anyhow!("{err}"))?;
     if cli.batch_size == 0 {
         return Err(anyhow!("--batch-size must be at least 1"));
+    }
+    // An empty --api-key usually means an unset environment variable in a
+    // script; treating it as "authentication enabled with an empty secret"
+    // would authorize any client that sends an empty key header.
+    if cli.api_key.as_ref().is_some_and(|key| key.is_empty()) {
+        return Err(anyhow!(
+            "--api-key must not be empty; unset it to serve without authentication"
+        ));
     }
 
     let config = InferenceConfig {

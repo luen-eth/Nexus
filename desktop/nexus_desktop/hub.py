@@ -27,6 +27,8 @@ import uuid
 
 from PySide6.QtCore import Qt, QObject, Signal, QSize, QBuffer, QByteArray, QIODevice, QThread, QFile
 from PySide6.QtGui import QIcon, QImageReader, QPixmap
+
+from . import __version__
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QProgressBar, QPushButton, QVBoxLayout, QWidget, QMessageBox,
@@ -273,7 +275,7 @@ class HubClient:
 
     def _open(self, url):
         self._validate_url(url, self.allow_local_http)
-        request = Request(url, headers={"User-Agent":"NexusDesktop/0.1", "Accept-Encoding":"identity"})
+        request = Request(url, headers={"User-Agent": f"NexusDesktop/{__version__}", "Accept-Encoding": "identity"})
         try:
             return self.opener.open(request, timeout=self.timeout)
         except HTTPError as error:

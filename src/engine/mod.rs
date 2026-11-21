@@ -89,7 +89,10 @@ impl Default for InferenceConfig {
         InferenceConfig {
             max_seq_len: 4096,
             batch_size: 1,
-            kv_quant: KvQuantType::TurboQuant3b2b,
+            // Unquantized by default: TurboQuant 3b/2b rescales every token
+            // with a single min/max pair and visibly degrades quality. It is
+            // an explicit opt-in, not a silent default.
+            kv_quant: KvQuantType::None,
             weight_format: QuantFormat::FP32,
             backend: BackendType::default(),
             rope_freq_base: 10000.0,
@@ -776,11 +779,19 @@ impl InferenceEngine {
         let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
         let arch_str = metadata.architecture().unwrap_or("unknown").to_string();
         let arch = ModelArch::from_str(&arch_str);
-        if arch != ModelArch::Llama {
+        // Dense Mistral-7B graphs are identical to LLaMA (no sliding window,
+        // no MoE, standard RoPE), so they share the same execution path. The
+        // metadata keys of such files carry the `mistral.` prefix instead of
+        // the hard-coded `llama.` one.
+        if !matches!(arch, ModelArch::Llama | ModelArch::Mistral) {
             return Err(invalid(format!(
-                "Unsupported inference architecture: {arch_str}; only llama is implemented"
+                "Unsupported inference architecture: {arch_str}; only llama and mistral are implemented"
             )));
         }
+        let arch_prefix = match arch {
+            ModelArch::Mistral => "mistral",
+            _ => "llama",
+        };
         if !matches!(
             self.config.backend,
             BackendType::CpuSimd | BackendType::Cuda
@@ -791,17 +802,19 @@ impl InferenceEngine {
                 self.config.backend.name()
             )));
         }
-        let required = |key: &str| {
+        let required = |key: String| {
             metadata
-                .get_usize(key)
+                .get_usize(&key)
                 .ok_or_else(|| invalid(format!("Missing model dimension: {key}")))
         };
-        let num_layers = required("llama.block_count")?;
-        let hidden_size = required("llama.embedding_length")?;
-        let ff_dim = required("llama.feed_forward_length")?;
-        let num_heads = required("llama.attention.head_count")?;
-        let num_kv_heads = metadata.num_key_value_heads().unwrap_or(num_heads);
-        let model_context = required("llama.context_length")?;
+        let num_layers = required(format!("{arch_prefix}.block_count"))?;
+        let hidden_size = required(format!("{arch_prefix}.embedding_length"))?;
+        let ff_dim = required(format!("{arch_prefix}.feed_forward_length"))?;
+        let num_heads = required(format!("{arch_prefix}.attention.head_count"))?;
+        let num_kv_heads = metadata
+            .get_usize(&format!("{arch_prefix}.attention.head_count_kv"))
+            .unwrap_or(num_heads);
+        let model_context = required(format!("{arch_prefix}.context_length"))?;
         if hidden_size == 0
             || ff_dim == 0
             || num_heads == 0
@@ -814,13 +827,13 @@ impl InferenceEngine {
             return Err(invalid("Invalid model dimensions or context length".into()));
         }
         if metadata
-            .get_usize("llama.expert_count")
+            .get_usize(&format!("{arch_prefix}.expert_count"))
             .is_some_and(|n| n > 0)
             || metadata
-                .get_usize("llama.expert_used_count")
+                .get_usize(&format!("{arch_prefix}.expert_used_count"))
                 .is_some_and(|n| n > 0)
             || metadata
-                .get_usize("llama.attention.sliding_window")
+                .get_usize(&format!("{arch_prefix}.attention.sliding_window"))
                 .is_some_and(|n| n > 0)
             || metadata
                 .tensors
@@ -833,17 +846,21 @@ impl InferenceEngine {
         }
         let head_dim = hidden_size / num_heads;
         for key in [
-            "llama.attention.key_length",
-            "llama.attention.value_length",
-            "llama.rope.dimension_count",
+            format!("{arch_prefix}.attention.key_length"),
+            format!("{arch_prefix}.attention.value_length"),
+            format!("{arch_prefix}.rope.dimension_count"),
         ] {
-            if metadata.metadata.contains_key(key) && metadata.get_usize(key) != Some(head_dim) {
+            if metadata.metadata.contains_key(&key) && metadata.get_usize(&key) != Some(head_dim) {
                 return Err(invalid(format!(
                     "Unsupported or invalid head dimension: {key}"
                 )));
             }
         }
-        if head_dim % 2 != 0 || metadata.rope_dim().is_some_and(|dim| dim != head_dim) {
+        if head_dim % 2 != 0
+            || metadata
+                .get_usize(&format!("{arch_prefix}.rope.dimension_count"))
+                .is_some_and(|dim| dim != head_dim)
+        {
             return Err(invalid(
                 "Only full, even-sized RoPE head dimensions are supported".into(),
             ));
@@ -853,10 +870,11 @@ impl InferenceEngine {
             .iter()
             .any(|tensor| tensor.name == "rope_freqs.weight")
             || metadata.metadata.iter().any(|(key, value)| {
-                key == "llama.rope.scale_linear"
-                    || key == "llama.rope.scale"
-                    || (key.starts_with("llama.rope.scaling.")
-                        && !(key == "llama.rope.scaling.type" && value.as_str() == Some("none")))
+                key == &format!("{arch_prefix}.rope.scale_linear")
+                    || key == &format!("{arch_prefix}.rope.scale")
+                    || (key.starts_with(&format!("{arch_prefix}.rope.scaling."))
+                        && !(key == &format!("{arch_prefix}.rope.scaling.type")
+                            && value.as_str() == Some("none")))
             })
         {
             return Err(invalid(
@@ -873,9 +891,9 @@ impl InferenceEngine {
                     .ok_or_else(|| invalid(format!("Invalid floating model parameter: {key}"))),
             }
         };
-        config.rope_freq_base = parameter("llama.rope.freq_base", 10000.0)?;
+        config.rope_freq_base = parameter(&format!("{arch_prefix}.rope.freq_base"), 10000.0)?;
         config.rms_norm_eps = parameter(
-            "llama.attention.layer_norm_rms_epsilon",
+            &format!("{arch_prefix}.attention.layer_norm_rms_epsilon"),
             config.rms_norm_eps,
         )?;
         if !config.rope_freq_base.is_finite()
@@ -2010,7 +2028,9 @@ mod tests {
         let config = InferenceConfig::default();
         assert_eq!(config.max_seq_len, 4096);
         assert_eq!(config.batch_size, 1);
-        assert_eq!(config.kv_quant, KvQuantType::TurboQuant3b2b);
+        // The unquantized cache is the default: TurboQuant 3b/2b visibly
+        // degrades output quality and every recorded reference ran unquantized.
+        assert_eq!(config.kv_quant, KvQuantType::None);
     }
 
     #[test]

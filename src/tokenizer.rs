@@ -447,7 +447,9 @@ impl Tokenizer for RuntimeTokenizer {
 pub fn filter_stop_text<'a>(text: &'a str, stops: &[String], finished: bool) -> (&'a str, bool) {
     if let Some(index) = stops
         .iter()
-        .filter(|s| !s.is_empty())
+        // A stop longer than the text can never match; skipping it keeps the
+        // per-token scan bounded on the generation worker.
+        .filter(|s| !s.is_empty() && s.len() <= text.len())
         .filter_map(|s| text.find(s))
         .min()
     {
@@ -461,6 +463,9 @@ pub fn filter_stop_text<'a>(text: &'a str, stops: &[String], finished: bool) -> 
         .flat_map(|s| {
             s.char_indices()
                 .skip(1)
+                // Only prefixes that can actually end at `text`'s end are
+                // candidates, so the scan never walks past `text.len()`.
+                .take_while(|(index, _)| *index <= text.len())
                 .map(move |(index, _)| (&s[..index], index))
         })
         .filter(|(prefix, _)| text.ends_with(prefix))

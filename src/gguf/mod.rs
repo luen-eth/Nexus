@@ -529,43 +529,60 @@ impl ModelMetadata {
             .or_else(|| self.get_str("llama.vocab_size"))
     }
 
+    /// Resolve an architecture-scoped metadata key: try the file's own
+    /// architecture prefix first, then the `llama.` fallback so that pre-arch
+    /// tooling and `llama`-labelled files keep working.
+    fn arch_usize(&self, key: &str) -> Option<usize> {
+        if let Some(arch) = self.architecture() {
+            if let Some(value) = self.get_usize(&format!("{arch}.{key}")) {
+                return Some(value);
+            }
+        }
+        self.get_usize(&format!("llama.{key}"))
+    }
+
     /// Get context length
     pub fn context_length(&self) -> Option<usize> {
-        self.get_usize("llama.context_length")
+        self.arch_usize("context_length")
     }
 
     /// Get number of attention heads
     pub fn num_attention_heads(&self) -> Option<usize> {
-        self.get_usize("llama.attention.head_count")
+        self.arch_usize("attention.head_count")
     }
 
     /// Get number of key heads (for GQA)
     pub fn num_key_value_heads(&self) -> Option<usize> {
-        self.get_usize("llama.attention.head_count_kv")
+        self.arch_usize("attention.head_count_kv")
     }
 
     /// Get number of layers
     pub fn num_layers(&self) -> Option<usize> {
-        self.get_usize("llama.block_count")
+        self.arch_usize("block_count")
     }
 
     /// Get hidden size
     pub fn hidden_size(&self) -> Option<usize> {
-        self.get_usize("llama.embedding_length")
+        self.arch_usize("embedding_length")
     }
 
     /// Get feed forward size
     pub fn feed_forward_size(&self) -> Option<usize> {
-        self.get_usize("llama.feed_forward_length")
+        self.arch_usize("feed_forward_length")
     }
 
     /// Get rope dimensionality
     pub fn rope_dim(&self) -> Option<usize> {
-        self.get_usize("llama.rope.dimension_count")
+        self.arch_usize("rope.dimension_count")
     }
 
     /// Get rope frequency base
     pub fn rope_freq_base(&self) -> f32 {
+        if let Some(arch) = self.architecture() {
+            if let Some(value) = self.get_f32(&format!("{arch}.rope.freq_base")) {
+                return value;
+            }
+        }
         self.get_f32("llama.rope.freq_base").unwrap_or(10000.0)
     }
 

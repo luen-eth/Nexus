@@ -70,8 +70,8 @@ enum Commands {
         #[arg(long, default_value_t = 4096)]
         ctx_size: usize,
 
-        /// KV cache quantization type
-        #[arg(long, default_value = "tq_3b2b")]
+        /// KV cache quantization type; none keeps the reference float quality
+        #[arg(long, default_value = "none")]
         kv_quant: String,
 
         /// Runtime weight storage (FP32 only); use convert for file quantization.
@@ -124,8 +124,8 @@ enum Commands {
         #[arg(long)]
         threads: Option<usize>,
 
-        /// KV format used for the benchmark.
-        #[arg(long, default_value = "tq_3b2b")]
+        /// KV format used for the benchmark; none keeps the reference float quality
+        #[arg(long, default_value = "none")]
         kv_quant: String,
 
         /// Allow a byte tokenizer only for synthetic test fixtures.
@@ -798,7 +798,11 @@ fn show_model_info(model_path: &std::path::Path) -> Result<()> {
     if let Some(vocab) = metadata.vocab_size() {
         println!("Vocabulary size: {}", vocab);
     }
-    if let Some(freq_base) = metadata.metadata.get("llama.rope.freq_base") {
+    if let Some(freq_base) = metadata
+        .metadata
+        .get("llama.rope.freq_base")
+        .or_else(|| metadata.metadata.get("mistral.rope.freq_base"))
+    {
         if let Some(f) = freq_base.as_f32() {
             println!("Rope freq base: {}", f);
         }

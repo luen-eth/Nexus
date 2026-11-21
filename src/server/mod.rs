@@ -94,6 +94,27 @@ impl StopSpec {
     }
 }
 
+/// Stop-string limits. Stop matching runs on the single generation worker for
+/// every decoded token; without a bound, one request could pin that thread
+/// with quadratic scans over megabyte-long stop strings.
+const MAX_STOP_SEQUENCES: usize = 16;
+const MAX_STOP_BYTES: usize = 1024;
+
+fn validate_stops(stops: &[String]) -> Result<(), ApiError> {
+    if stops.len() > MAX_STOP_SEQUENCES {
+        return Err(ApiError::bad_request(format!(
+            "at most {MAX_STOP_SEQUENCES} stop sequences are accepted per request"
+        )));
+    }
+    if let Some(stop) = stops.iter().find(|stop| stop.len() > MAX_STOP_BYTES) {
+        return Err(ApiError::bad_request(format!(
+            "each stop sequence must be at most {MAX_STOP_BYTES} bytes; this one is {} bytes",
+            stop.len()
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -548,11 +569,22 @@ fn is_public_path(path: &str) -> bool {
 }
 
 fn authorized(req: &Request<Body>, api_key: &str) -> bool {
+    if api_key.is_empty() {
+        // Defense in depth: an empty configured secret must never authorize
+        // an empty client key, even if a caller bypassed startup validation.
+        return false;
+    }
+    // RFC 7235: the auth scheme is case-insensitive (`bearer`, `Bearer`, ...).
     let bearer = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
+        .and_then(|value| {
+            let (scheme, credentials) = value.split_once(char::is_whitespace)?;
+            scheme
+                .eq_ignore_ascii_case("bearer")
+                .then(|| credentials.trim_start())
+        });
     let x_api_key = req
         .headers()
         .get("x-api-key")
@@ -596,7 +628,7 @@ fn status_error(status: StatusCode, message: &str) -> Response {
         s if s.is_client_error() => "invalid_request_error",
         _ => "server_error",
     };
-    (
+    let mut response = (
         status,
         Json(serde_json::json!({
             "error": {
@@ -605,7 +637,14 @@ fn status_error(status: StatusCode, message: &str) -> Response {
             }
         })),
     )
-        .into_response()
+        .into_response();
+    // OpenAI SDKs back off on 429/503 much more smoothly with a hint.
+    if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    response
 }
 
 fn sampling_params(
@@ -649,7 +688,11 @@ async fn chat_completions(
                 })
                 .collect(),
         ),
-        stop: req.stop.map(StopSpec::into_vec).unwrap_or_default(),
+        stop: {
+            let stops = req.stop.map(StopSpec::into_vec).unwrap_or_default();
+            validate_stops(&stops)?;
+            stops
+        },
         sampling: sampling_params(
             req.max_tokens,
             req.temperature,
@@ -708,6 +751,7 @@ async fn completions(
         )));
     }
     let stop = req.stop.map(StopSpec::into_vec).unwrap_or_default();
+    validate_stops(&stop)?;
     let sampling = sampling_params(
         req.max_tokens,
         req.temperature,
@@ -1151,24 +1195,35 @@ pub fn parse_backend(value: &str) -> Result<BackendType, ApiError> {
     }
 }
 
-async fn health(State(state): State<ServerState>) -> Json<serde_json::Value> {
+async fn health(State(state): State<ServerState>) -> Response {
     let snapshot = state.runtime.snapshot();
     let stats = state.runtime.stats();
     let worker_ok = state.runtime.is_alive() && stats.backend_healthy;
-    let status = if !worker_ok {
-        "error"
-    } else if snapshot.loaded {
-        "ok"
+    let (status, code) = health_status(worker_ok, snapshot.loaded);
+    (
+        code,
+        Json(serde_json::json!({
+            "status": status,
+            "model_loaded": snapshot.loaded,
+            "model": snapshot.name,
+            "active_sequences": stats.active,
+            "queued_requests": stats.queued,
+        })),
+    )
+        .into_response()
+}
+
+/// Health status label and HTTP code for one snapshot. Code-based probes
+/// (Kubernetes, load balancers) must see a dead worker as a failure instead
+/// of routing traffic to a 200-with-error-body instance.
+fn health_status(worker_ok: bool, loaded: bool) -> (&'static str, StatusCode) {
+    if !worker_ok {
+        ("error", StatusCode::SERVICE_UNAVAILABLE)
+    } else if loaded {
+        ("ok", StatusCode::OK)
     } else {
-        "degraded"
-    };
-    Json(serde_json::json!({
-        "status": status,
-        "model_loaded": snapshot.loaded,
-        "model": snapshot.name,
-        "active_sequences": stats.active,
-        "queued_requests": stats.queued,
-    }))
+        ("degraded", StatusCode::OK)
+    }
 }
 
 async fn metrics(State(state): State<ServerState>) -> Json<serde_json::Value> {
@@ -1316,27 +1371,33 @@ pub async fn run_server_with_requested_config(
         options,
         requested_config,
     )?;
-    let addr = format!("{}:{}", host, port);
+    // Tuple-form bind accepts both IPv4 and IPv6 literals ("::1"), which the
+    // previous `format!("{host}:{port}")` string could not represent.
+    let display_addr = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
 
-    println!("Nexus API server starting on {}", addr);
+    println!("Nexus API server starting on {}", display_addr);
     println!(
         "Generation: token-interleaved worker, up to {} concurrent sequences, {} queued",
         max_active, max_pending
     );
     println!("OpenAI-compatible endpoints:");
-    println!("  POST {}/v1/chat/completions", addr);
-    println!("  POST {}/v1/completions", addr);
-    println!("  GET  {}/v1/models", addr);
-    println!("  GET  {}/v1/model", addr);
-    println!("  POST {}/v1/model/load", addr);
-    println!("  POST {}/v1/model/reload", addr);
-    println!("  POST {}/v1/model/unload", addr);
-    println!("  GET  {}/v1/backends", addr);
-    println!("  GET  {}/health", addr);
-    println!("  GET  {}/metrics", addr);
+    println!("  POST {}/v1/chat/completions", display_addr);
+    println!("  POST {}/v1/completions", display_addr);
+    println!("  GET  {}/v1/models", display_addr);
+    println!("  GET  {}/v1/model", display_addr);
+    println!("  POST {}/v1/model/load", display_addr);
+    println!("  POST {}/v1/model/reload", display_addr);
+    println!("  POST {}/v1/model/unload", display_addr);
+    println!("  GET  {}/v1/backends", display_addr);
+    println!("  GET  {}/health", display_addr);
+    println!("  GET  {}/metrics", display_addr);
     println!();
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind((host, port)).await?;
     serve(listener, state).await?;
 
     Ok(())
@@ -2941,5 +3002,19 @@ mod tests {
             assert_eq!(runtime.snapshot().requested_config.max_seq_len, 1024);
         }
         task.abort();
+    }
+
+    #[test]
+    fn health_reports_a_dead_worker_as_503_for_code_based_probes() {
+        assert_eq!(
+            health_status(false, false),
+            ("error", StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(
+            health_status(false, true),
+            ("error", StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(health_status(true, true), ("ok", StatusCode::OK));
+        assert_eq!(health_status(true, false), ("degraded", StatusCode::OK));
     }
 }

@@ -67,17 +67,25 @@ impl Drop for TestServer {
 }
 impl TestServer {
     async fn new(name: &str, utf8: bool, options: RuntimeOptions) -> Self {
-        let state = ServerState::new(
-            engine(name, utf8),
-            None,
+        Self::new_with_config(
+            name,
+            utf8,
+            options,
             ServerConfig {
                 api_key: None,
                 cors_origin: None,
                 rate_limit_per_minute: None,
             },
-            options,
         )
-        .unwrap();
+        .await
+    }
+    async fn new_with_config(
+        name: &str,
+        utf8: bool,
+        options: RuntimeOptions,
+        config: ServerConfig,
+    ) -> Self {
+        let state = ServerState::new(engine(name, utf8), None, config, options).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let copy = state.clone();
@@ -412,4 +420,126 @@ async fn unsupported_runtime_weight_storage_is_rejected_before_replacing_the_mod
         .contains("only f32"));
     assert_eq!(server.state.runtime.snapshot().epoch, epoch);
     assert_eq!(server.state.runtime.snapshot().name, "audit-A");
+}
+
+#[tokio::test]
+async fn an_empty_configured_api_key_never_authorizes_an_empty_client_key() {
+    // `--api-key "$NEXUS_API_KEY"` with an unset variable produces Some("");
+    // a client sending an empty key header must not be authorized by it.
+    let server = TestServer::new_with_config(
+        "audit-A",
+        false,
+        options(),
+        ServerConfig {
+            api_key: Some(String::new()),
+            cors_origin: None,
+            rate_limit_per_minute: None,
+        },
+    )
+    .await;
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let url = format!("{}/v1/models", server.base);
+    let status = |r: reqwest::Response| r.status().as_u16();
+    assert_eq!(
+        status(http.get(&url).header("x-api-key", "").send().await.unwrap()),
+        401
+    );
+    assert_eq!(
+        status(
+            http.get(&url)
+                .header("authorization", "Bearer ")
+                .send()
+                .await
+                .unwrap()
+        ),
+        401
+    );
+    // The public path stays reachable and unauthenticated.
+    let health = http
+        .get(format!("{}/health", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 200);
+}
+
+#[tokio::test]
+async fn bearer_scheme_matching_is_case_insensitive() {
+    let server = TestServer::new_with_config(
+        "audit-A",
+        false,
+        options(),
+        ServerConfig {
+            api_key: Some("s3cret".into()),
+            cors_origin: None,
+            rate_limit_per_minute: None,
+        },
+    )
+    .await;
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let url = format!("{}/v1/models", server.base);
+    for scheme in ["bearer", "BEARER", "BeArEr"] {
+        let response = http
+            .get(&url)
+            .header("authorization", format!("{scheme} s3cret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "scheme {scheme}");
+    }
+    let response = http
+        .get(&url)
+        .header("authorization", "bearer wrong")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+}
+
+#[tokio::test]
+async fn oversized_stop_payloads_are_rejected_before_reaching_the_worker() {
+    let server = TestServer::new("audit-A", false, options()).await;
+    let seventeen_stops: Vec<&str> = vec!["a"; 17];
+    let huge_stop = "a".repeat(1025);
+    for (stop, detail) in [
+        (json!(seventeen_stops), "too many stops"),
+        (json!(huge_stop), "too long stop"),
+        (json!(["ok", huge_stop]), "too long stop among many"),
+    ] {
+        let response = server
+            .post(
+                "/v1/completions",
+                json!({"model":"audit-A","prompt":"x","max_tokens":2,"stop":stop}),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{detail}");
+        let response = server
+            .post(
+                "/v1/chat/completions",
+                json!({"model":"audit-A","messages":[{"role":"user","content":"x"}],"max_tokens":2,"stop":stop}),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{detail}");
+    }
+    // Rejected payloads never reached the scheduler.
+    assert_eq!(server.state.scheduler().stats(), (0, 0, 0));
+    // The in-bounds case (16 stops, 1024 bytes) still works.
+    let stops: Vec<String> = (0..16).map(|i| format!("stop-{i}")).collect();
+    let response = server
+        .post(
+            "/v1/completions",
+            json!({"model":"audit-A","prompt":"x","max_tokens":2,"stop":stops}),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(body(response).await["choices"][0]["text"], "aa");
+    until(|| server.state.runtime.stats().active == 0).await;
 }

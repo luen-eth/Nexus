@@ -31,8 +31,9 @@ struct Cli {
     #[arg(short, long)]
     output: PathBuf,
 
-    /// Quantization format
-    #[arg(long, default_value = "q4-0")]
+    /// Quantization format. The default is a faithful F32 copy; lossy codecs
+    /// must be requested explicitly, as in llama.cpp converters.
+    #[arg(long, default_value = "f32")]
     quant: QuantFormat,
 
     /// Add TurboQuant KV cache metadata
@@ -198,11 +199,33 @@ fn validate_model_config(loader: &MlxModelLoader) -> Result<()> {
         .config
         .as_ref()
         .context("A valid config.json is required for model conversion")?;
-    if config.model_type.as_deref() != Some("llama") {
+    // Dense Mistral-7B graphs are identical to LLaMA, so both convert through
+    // the same path. Anything else stays an explicit rejection.
+    let accepted_architectures = ["llama", "mistral"];
+    let model_type = config
+        .model_type
+        .as_deref()
+        .context("config.json is missing model_type")?;
+    if !accepted_architectures.contains(&model_type) {
         anyhow::bail!(
-            "Unsupported model architecture {:?}; only dense llama conversion is implemented",
-            config.model_type
+            "Unsupported model architecture {model_type:?}; only dense llama and mistral conversion are implemented"
         );
+    }
+    // The engine implements unscaled RoPE only. Dropping a `rope_scaling`
+    // declaration silently would produce a file that loads fine and then
+    // generates wrong long-context output, so refuse the conversion instead.
+    if let Some(scaling) = &config.rope_scaling {
+        let declares_none = ["rope_type", "type"].iter().any(|key| {
+            scaling
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case("none"))
+        });
+        if !declares_none {
+            anyhow::bail!(
+                "config.json declares rope_scaling ({scaling}); scaled-RoPE conversion is not implemented. Convert an unscaled checkpoint"
+            );
+        }
     }
     for (name, value) in [
         ("hidden_size", config.hidden_size),
@@ -424,37 +447,57 @@ fn build_metadata(
                 GgufValue::String(model_type.clone()),
             );
         }
-        insert_usize(&mut metadata, "llama.embedding_length", config.hidden_size);
-        insert_usize(&mut metadata, "llama.block_count", config.num_hidden_layers);
+        // Accepted architectures are validated as llama or mistral; keep the
+        // metadata keys consistent with the declared architecture so the
+        // engine resolves dimensions through the matching prefix.
+        let prefix = if config.model_type.as_deref() == Some("mistral") {
+            "mistral"
+        } else {
+            "llama"
+        };
         insert_usize(
             &mut metadata,
-            "llama.attention.head_count",
+            &format!("{prefix}.embedding_length"),
+            config.hidden_size,
+        );
+        insert_usize(
+            &mut metadata,
+            &format!("{prefix}.block_count"),
+            config.num_hidden_layers,
+        );
+        insert_usize(
+            &mut metadata,
+            &format!("{prefix}.attention.head_count"),
             config.num_attention_heads,
         );
         insert_usize(
             &mut metadata,
-            "llama.attention.head_count_kv",
+            &format!("{prefix}.attention.head_count_kv"),
             config.num_key_value_heads,
         );
         insert_usize(
             &mut metadata,
-            "llama.feed_forward_length",
+            &format!("{prefix}.feed_forward_length"),
             config.intermediate_size,
         );
-        insert_usize(&mut metadata, "llama.vocab_size", config.vocab_size);
         insert_usize(
             &mut metadata,
-            "llama.context_length",
+            &format!("{prefix}.vocab_size"),
+            config.vocab_size,
+        );
+        insert_usize(
+            &mut metadata,
+            &format!("{prefix}.context_length"),
             config.max_position_embeddings,
         );
         if let Some(eps) = config.rms_norm_eps {
             metadata.insert(
-                "llama.attention.layer_norm_rms_epsilon".to_string(),
+                format!("{prefix}.attention.layer_norm_rms_epsilon"),
                 GgufValue::F32(eps),
             );
         }
         if let Some(theta) = config.rope_theta {
-            metadata.insert("llama.rope.freq_base".to_string(), GgufValue::F32(theta));
+            metadata.insert(format!("{prefix}.rope.freq_base"), GgufValue::F32(theta));
         }
     }
 
@@ -476,6 +519,21 @@ fn build_metadata(
     insert_tokenizer_metadata(&mut metadata, input)?;
 
     Ok(metadata)
+}
+
+/// Token-id ceiling for tokenizer.json imports. Real vocabularies stay far
+/// below this; without a bound, `tokens.resize(id + 1, …)` with a hostile or
+/// corrupt id panics on overflow (debug) or aborts the process on allocation
+/// failure (release) instead of returning a conversion error.
+const MAX_TOKEN_ID: u64 = 1 << 24;
+
+fn checked_token_id(id: u64) -> Result<usize> {
+    if id >= MAX_TOKEN_ID {
+        anyhow::bail!(
+            "token id {id} exceeds the conversion limit {MAX_TOKEN_ID}; tokenizer.json is malformed"
+        );
+    }
+    usize::try_from(id).context("token id does not fit the platform")
 }
 
 fn insert_usize(metadata: &mut HashMap<String, GgufValue>, key: &str, value: Option<usize>) {
@@ -667,11 +725,11 @@ fn insert_tokenizer_metadata(
             .values()
             .filter_map(serde_json::Value::as_u64)
             .max()
-            .unwrap_or(0) as usize;
-        tokens.resize(max_id + 1, String::new());
+            .unwrap_or(0);
+        tokens.resize(checked_token_id(max_id)? + 1, String::new());
         for (token, id) in vocab {
             if let Some(id) = id.as_u64() {
-                let id = id as usize;
+                let id = checked_token_id(id)?;
                 if id >= tokens.len() {
                     tokens.resize(id + 1, String::new());
                 }
@@ -692,7 +750,7 @@ fn insert_tokenizer_metadata(
             let Some(content) = token.get("content").and_then(serde_json::Value::as_str) else {
                 continue;
             };
-            let id = id as usize;
+            let id = checked_token_id(id)?;
             if id >= tokens.len() {
                 tokens.resize(id + 1, String::new());
             }
@@ -1283,5 +1341,126 @@ mod tests {
             assert!(build_metadata(&loader, &dir, false).is_err());
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn config_fixture_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nexus-{tag}-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        write_f32_safetensors(
+            &dir.join("model.safetensors"),
+            "model.embed_tokens.weight",
+            &[1, 2],
+            &[1., 2.],
+        );
+        dir
+    }
+
+    #[test]
+    fn mistral_conversion_writes_mistral_prefixed_metadata() {
+        let dir = config_fixture_dir("mistral");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"mistral","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"intermediate_size":4,"vocab_size":2,"max_position_embeddings":16}"#,
+        )
+        .unwrap();
+        let loader = MlxModelLoader::new(&dir).unwrap();
+        validate_model_config(&loader).unwrap();
+        let metadata = build_metadata(&loader, &dir, false).unwrap();
+        assert!(matches!(
+            metadata.get("general.architecture"),
+            Some(GgufValue::String(value)) if value == "mistral"
+        ));
+        assert!(metadata.contains_key("mistral.embedding_length"));
+        assert!(metadata.contains_key("mistral.block_count"));
+        assert!(metadata.contains_key("mistral.context_length"));
+        assert!(
+            !metadata.contains_key("llama.embedding_length"),
+            "keys must follow the declared architecture, not a hard-coded prefix"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rope_scaling_declarations_are_rejected_unless_they_declare_none() {
+        let base = r#"{"model_type":"llama","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"intermediate_size":4,"vocab_size":2,"max_position_embeddings":16"#;
+        for (extra, expect_ok) in [
+            (
+                Some(r#""rope_scaling":{"rope_type":"llama3","factor":8.0}"#),
+                false,
+            ),
+            (
+                Some(r#""rope_scaling":{"type":"linear","factor":32.0}"#),
+                false,
+            ),
+            (Some(r#""rope_scaling":{"rope_type":"none"}"#), true),
+            (None, true),
+        ] {
+            let mut config = base.to_string();
+            if let Some(extra) = extra {
+                config.push(',');
+                config.push_str(extra);
+            }
+            config.push('}');
+            let dir = config_fixture_dir("rope-scaling");
+            fs::write(dir.join("config.json"), &config).unwrap();
+            let loader = MlxModelLoader::new(&dir).unwrap();
+            let result = validate_model_config(&loader);
+            assert_eq!(result.is_ok(), expect_ok, "config: {config}");
+            if expect_ok {
+                assert!(build_metadata(&loader, &dir, false).is_ok());
+            } else {
+                let message = result.unwrap_err().to_string();
+                assert!(
+                    message.contains("rope_scaling"),
+                    "the rejection must name rope_scaling: {message}"
+                );
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn hostile_tokenizer_token_ids_fail_conversion_instead_of_aborting() {
+        let dir = config_fixture_dir("token-ids");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"llama","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"intermediate_size":4,"vocab_size":2,"max_position_embeddings":16}"#,
+        )
+        .unwrap();
+        // The `model` object is required; without it the failure would come
+        // from tokenizer validation instead of the token-id guard.
+        for hostile in [
+            r#"{"model":{"type":"bpe","vocab":{"a":0}},"added_tokens":[{"id":18446744073709551615,"content":"x"}]}"#,
+            r#"{"model":{"type":"bpe","vocab":{"a":10000000000}}}"#,
+        ] {
+            fs::write(dir.join("tokenizer.json"), hostile).unwrap();
+            let loader = MlxModelLoader::new(&dir).unwrap();
+            let result = build_metadata(&loader, &dir, false);
+            let message = result
+                .as_ref()
+                .map(|_| String::new())
+                .unwrap_or_else(|err| err.to_string());
+            assert!(result.is_err(), "hostile ids must be rejected: {hostile}");
+            assert!(
+                message.contains("token id"),
+                "the rejection must come from the token-id guard: {message}"
+            );
+        }
+        // In-bounds ids still convert.
+        fs::write(
+            dir.join("tokenizer.json"),
+            r#"{"model":{"type":"bpe","vocab":{"a":0,"b":1}},"added_tokens":[{"id":5,"content":"<pad>"}]}"#,
+        )
+        .unwrap();
+        let loader = MlxModelLoader::new(&dir).unwrap();
+        assert!(build_metadata(&loader, &dir, false).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

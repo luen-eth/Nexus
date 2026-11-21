@@ -8,7 +8,7 @@ This document describes the November 2026 correctness and optimization work. Nex
 | --- | --- |
 | GGUF and quantization | Official GGML type IDs and block geometry; independent Q2_K/Q4_K reference blocks; checked dimensions, offsets, metadata limits, EOF and tensor overlap |
 | Safetensors | Checked header size, dtype/shape byte length and data ranges; duplicate/gapped/overlapping tensors rejected; explicit little-endian reads |
-| Conversion | Supported LLaMA architecture only; correct Q/K RoPE permutation and axes; atomic output replacement; incompatible block rows retained as floating point |
+| Conversion | Supported LLaMA and Mistral (identical dense graphs) architectures only; `rope_scaling` declarations are rejected instead of silently dropped; correct Q/K RoPE permutation and axes; atomic output replacement; incompatible block rows retained as floating point |
 | Model loading | Required tensors, supported RoPE and tokenizer validated; failed replacement preserves the previous model; no synthetic fallback |
 | Tokenization | Embedded HF pipeline or native GGUF vocabulary; special tokens, chat templates, EOS/EOT, stop text and UTF-8 stream handling |
 | Sessions | Independent KV cache and RNG; context and token budgets checked; no unused final forward pass |

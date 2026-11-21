@@ -77,6 +77,11 @@ pub struct MlxModelConfig {
     pub max_position_embeddings: Option<usize>,
     pub rms_norm_eps: Option<f32>,
     pub rope_theta: Option<f32>,
+    /// HF rope scaling declaration (Llama-3 style `rope_scaling` objects).
+    /// The engine rejects scaled RoPE, so conversion must refuse it loudly
+    /// instead of silently producing a wrong-RoPE GGUF.
+    #[serde(default)]
+    pub rope_scaling: Option<serde_json::Value>,
 }
 
 impl MlxModelConfig {

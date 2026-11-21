@@ -32,6 +32,38 @@ fn context_override_is_preserved_and_clamped_to_model_limit() {
 }
 
 #[test]
+fn mistral_architecture_is_accepted_with_identical_outputs() {
+    // Dense Mistral graphs are identical to LLaMA; the same weights under
+    // `mistral.*` metadata keys must load and produce the same logits.
+    let mut llama = engine(&TinyModel::new(), InferenceConfig::default());
+
+    let mut mistral_model = TinyModel::new();
+    mistral_model.metadata = mistral_model
+        .metadata
+        .iter()
+        .map(|(key, value)| {
+            let renamed = key
+                .strip_prefix("llama.")
+                .map(|rest| format!("mistral.{rest}"))
+                .unwrap_or_else(|| key.clone());
+            (renamed, value.clone())
+        })
+        .collect();
+    mistral_model
+        .metadata
+        .insert("general.architecture".into(), Value::Text("mistral".into()));
+    let mut mistral = engine(&mistral_model, InferenceConfig::default());
+
+    for prompt in [[0u32, 1, 2], [3, 0, 1]] {
+        assert_eq!(
+            llama.prefill(&prompt).unwrap(),
+            mistral.prefill(&prompt).unwrap(),
+            "logits must not depend on the metadata prefix"
+        );
+    }
+}
+
+#[test]
 fn invalid_loads_fail_without_replacing_the_working_model() {
     let mut engine = engine(&TinyModel::new(), InferenceConfig::default());
     let before = engine.prefill(&[0, 1]).unwrap();

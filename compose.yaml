@@ -8,6 +8,10 @@ services:
       - nvidia.com/gpu=all
     environment:
       NEXUS_API_KEY: ${NEXUS_API_KEY:?Set NEXUS_API_KEY for the server and desktop client}
+      # A default per-peer limit so container deployments do not ship without
+      # any rate limiting. Override or unset via NEXUS_RATE_LIMIT_PER_MINUTE=0
+      # only when a proxy in front enforces its own limit.
+      NEXUS_RATE_LIMIT_PER_MINUTE: ${NEXUS_RATE_LIMIT_PER_MINUTE:-600}
     ports:
       - "127.0.0.1:${NEXUS_PORT:-8080}:8080"
     volumes:

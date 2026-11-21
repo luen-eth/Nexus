@@ -47,7 +47,7 @@ The default build needs neither an NVIDIA driver nor Apple libraries on Linux.
 
 ### 2. Run a supported model
 
-Use a LLaMA-architecture GGUF with a complete tokenizer. `model.gguf` below is your local model file.
+Use a LLaMA- or Mistral-architecture GGUF with a complete tokenizer. `model.gguf` below is your local model file.
 
 ```bash
 ./target/release/nexus info --model model.gguf
@@ -60,7 +60,7 @@ Use a LLaMA-architecture GGUF with a complete tokenizer. `model.gguf` below is y
   --kv-quant none
 ```
 
-`none` keeps the KV cache in floating point, which is useful as a correctness and performance reference. Low-bit KV formats are also available. Runtime weights are always **F32**, including when the source GGUF is quantized; file size does not describe required RAM or VRAM.
+`none` keeps the KV cache in floating point; it is the default, and it matches the recorded correctness and performance references. Low-bit KV formats are opt-in (`tq_3b2b` and similar visibly trade output quality for memory). Runtime weights are always **F32**, including when the source GGUF is quantized; file size does not describe required RAM or VRAM.
 
 CPU execution defaults to one thread. You can set a per-backend limit with `--threads 2` or `--threads 4`, up to the machine's available CPU count. Small projections stay serial to avoid thread-pool overhead. CUDA rejects this CPU-only option.
 
@@ -109,7 +109,7 @@ CUDA is a **hybrid execution path**. Each projection still copies its input and 
 
 | Area | Implemented behavior |
 | --- | --- |
-| **Models** | LLaMA architecture, GQA, SwiGLU and unscaled full-head RoPE. Unsupported architectures and scaled RoPE fail loading. |
+| **Models** | LLaMA and Mistral-7B architectures (identical dense graphs), GQA, SwiGLU and unscaled full-head RoPE. Other architectures and scaled RoPE fail loading with an explicit error. |
 | **Weight readers** | F32, F16, BF16, Q8_0, Q4_0, Q4_K and Q2_K payloads; materialized as F32 at runtime. |
 | **Tokenizers** | Embedded Hugging Face tokenizer JSON, or original GGUF vocabularies executed by native llama.cpp. |
 | **Chat templates** | Model Jinja templates, special-token context, named `default` templates and Python-compatible string/JSON behavior. Template errors are returned. |
