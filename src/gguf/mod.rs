@@ -594,7 +594,7 @@ impl ModelMetadata {
 
     /// Get vocabulary size
     pub fn vocab_size(&self) -> Option<usize> {
-        self.get_usize("llama.vocab_size")
+        self.arch_usize("vocab_size")
     }
 
     /// Get tensor by name

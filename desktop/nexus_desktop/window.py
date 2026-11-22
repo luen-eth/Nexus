@@ -738,7 +738,7 @@ class MainWindow(QMainWindow):
         # Matches both "only llama is implemented" and
         # "only llama and mistral are implemented" server messages.
         if "only llama" in message and "is implemented" in message:
-            message += (" Choose a compatible LLaMA-architecture GGUF in Models. "
+            message += (" Choose a LLaMA- or Mistral-architecture GGUF in Models. "
                         "Changing GPU or Docker settings cannot add support for this architecture.")
         self.notice.setText(message)
         self.notice.show()

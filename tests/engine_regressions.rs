@@ -61,6 +61,22 @@ fn mistral_architecture_is_accepted_with_identical_outputs() {
             "logits must not depend on the metadata prefix"
         );
     }
+
+    // The embedding-vs-vocab cross-check must read the architecture's own key:
+    // a mistral file whose declared vocab disagrees with the embedding rows
+    // has to fail exactly like a llama file (previously the check silently
+    // skipped because it read only `llama.vocab_size`).
+    mistral_model
+        .metadata
+        .insert("mistral.vocab_size".into(), Value::Uint(99));
+    let file = tempfile::NamedTempFile::new().unwrap();
+    mistral_model.write(file.path());
+    let mut engine = InferenceEngine::new(Some(InferenceConfig::default()));
+    let error = engine.load_model(file.path()).unwrap_err().to_string();
+    assert!(
+        error.contains("Vocabulary and embedding dimensions disagree"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

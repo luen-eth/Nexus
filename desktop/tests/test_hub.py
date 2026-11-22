@@ -19,7 +19,8 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QListWidgetItem
 from nexus_desktop.hub import (
     Cancelled, HubClient, HubError, HubFile, ModelHubPanel, PublisherLogoClient,
-    _allowed_url, inspect_gguf, list_local_models,
+    SUPPORTED_ARCHITECTURES, _allowed_url, _require_supported_architecture,
+    inspect_gguf, list_local_models,
 )
 
 APP = QApplication.instance() or QApplication(["nexus-hub-tests"])
@@ -252,6 +253,34 @@ class HubTests(unittest.TestCase):
         panel.shutdown()
         self.assertTrue(wait(lambda:not any(self.root.rglob("*.part"))))
         self.assertEqual(self.downloaded_files(),[])
+
+    def test_architecture_gate_follows_the_engine_support_set(self):
+        # Keep in sync with ModelArch acceptance in src/engine/mod.rs.
+        self.assertEqual(SUPPORTED_ARCHITECTURES, frozenset({"llama", "mistral"}))
+        for architecture in ("llama", "mistral"):
+            _require_supported_architecture(architecture)
+        for rejected in ("qwen2", "gemma", "gemma4", "phi", "deepseek"):
+            with self.assertRaises(HubError) as raised:
+                _require_supported_architecture(rejected)
+            self.assertIn("does not support", raised.exception.args[0])
+        # Unknown/absent metadata stays permissive; download gating handles it.
+        _require_supported_architecture(None)
+        _require_supported_architecture("")
+        # The download gate must offer mistral files exactly like llama ones.
+        panel = self.panel()
+        for architecture in ("llama", "mistral"):
+            item = QListWidgetItem("model.gguf")
+            item.setData(Qt.ItemDataRole.UserRole, self.file(architecture=architecture))
+            panel.file_list.addItem(item)
+            panel.file_list.setCurrentItem(item)
+            self.assertTrue(panel.download_button.isEnabled(), architecture)
+            self.assertNotIn("not currently supported", panel.file_detail.text())
+        item = QListWidgetItem("model.gguf")
+        item.setData(Qt.ItemDataRole.UserRole, self.file(architecture="gemma4"))
+        panel.file_list.addItem(item)
+        panel.file_list.setCurrentItem(item)
+        self.assertFalse(panel.download_button.isEnabled())
+        self.assertIn("not currently supported", panel.file_detail.text())
 
     def test_local_library_ignores_symlinks_and_split_load_is_blocked(self):
         self.root.mkdir()

@@ -332,7 +332,10 @@ fn permute_llama_qk(
         return Ok(values);
     }
     let config = config.context("Q/K conversion requires model config")?;
-    if config.model_type.as_deref() != Some("llama") {
+    // HF Mistral uses the same split-half RoPE pairing as LLaMA
+    // (`apply_rotary_pos_emb` + `rotate_half`), so both labels need the
+    // identical permute; skipping it would silently rotate wrong pairs.
+    if !matches!(config.model_type.as_deref(), Some("llama" | "mistral")) {
         return Ok(values);
     }
     let heads = config
@@ -1213,39 +1216,171 @@ mod tests {
     }
     #[test]
     fn llama_qk_permutation_interleaves_hf_split_halves_per_head() {
-        let config = nexus::mlx::MlxModelConfig::from_json(r#"{"model_type":"llama","hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1}"#).unwrap();
-        let q: Vec<f32> = (0..8).flat_map(|row| vec![row as f32; 8]).collect();
-        let k: Vec<f32> = (0..4).flat_map(|row| vec![row as f32; 8]).collect();
-        let q = permute_llama_qk(
-            "model.layers.0.self_attn.q_proj.weight",
-            &[8, 8],
-            q,
-            Some(&config),
+        // Mistral uses the same split-half RoPE pairing as LLaMA, so both
+        // labels must produce the identical permutation.
+        let configs = [
+            r#"{"model_type":"llama","hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1}"#,
+            r#"{"model_type":"mistral","hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1}"#,
+        ];
+        for (index, config_json) in configs.iter().enumerate() {
+            let config = nexus::mlx::MlxModelConfig::from_json(config_json).unwrap();
+            let q: Vec<f32> = (0..8).flat_map(|row| vec![row as f32; 8]).collect();
+            let k: Vec<f32> = (0..4).flat_map(|row| vec![row as f32; 8]).collect();
+            let q = permute_llama_qk(
+                "model.layers.0.self_attn.q_proj.weight",
+                &[8, 8],
+                q,
+                Some(&config),
+            )
+            .unwrap();
+            let k = permute_llama_qk(
+                "model.layers.0.self_attn.k_proj.weight",
+                &[4, 8],
+                k,
+                Some(&config),
+            )
+            .unwrap();
+            assert_eq!(
+                q.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|row| row[0])
+                    .collect::<Vec<_>>(),
+                vec![0., 2., 1., 3., 4., 6., 5., 7.],
+                "Q permutation for config {index}"
+            );
+            assert_eq!(
+                k.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|row| row[0])
+                    .collect::<Vec<_>>(),
+                vec![0., 2., 1., 3.],
+                "K permutation for config {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn mistral_conversion_matches_llama_conversion_end_to_end() {
+        // Same weights under both accepted labels: the converted GGUFs must be
+        // indistinguishable to the engine (identical logits). This is the
+        // regression gate for the Q/K permutation gate: before it covered
+        // mistral, the mistral file was written with unpermuted rows and
+        // silently produced wrong attention.
+        let llama_dir = tiny_llm_fixture_dir("mistral-e2e-llama", "llama");
+        let mistral_dir = tiny_llm_fixture_dir("mistral-e2e-mistral", "mistral");
+        let llama_file = convert_fixture(&llama_dir);
+        let mistral_file = convert_fixture(&mistral_dir);
+
+        let mut llama = engine_for_gguf(&llama_file);
+        let mut mistral = engine_for_gguf(&mistral_file);
+        for prompt in [[0u32, 1, 2], [3, 0, 1]] {
+            assert_eq!(
+                llama.prefill(&prompt).unwrap(),
+                mistral.prefill(&prompt).unwrap(),
+                "converted output must not depend on the model_type label"
+            );
+        }
+        fs::remove_dir_all(&llama_dir).unwrap();
+        fs::remove_dir_all(&mistral_dir).unwrap();
+    }
+
+    fn tiny_llm_fixture_dir(tag: &str, model_type: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nexus-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            format!(
+                r#"{{"model_type":"{model_type}","hidden_size":8,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":1,"intermediate_size":16,"vocab_size":4,"max_position_embeddings":32}}"#
+            ),
         )
         .unwrap();
-        let k = permute_llama_qk(
-            "model.layers.0.self_attn.k_proj.weight",
-            &[4, 8],
-            k,
-            Some(&config),
-        )
-        .unwrap();
-        assert_eq!(
-            q.as_chunks::<8>()
-                .0
-                .iter()
-                .map(|row| row[0])
-                .collect::<Vec<_>>(),
-            vec![0., 2., 1., 3., 4., 6., 5., 7.]
-        );
-        assert_eq!(
-            k.as_chunks::<8>()
-                .0
-                .iter()
-                .map(|row| row[0])
-                .collect::<Vec<_>>(),
-            vec![0., 2., 1., 3.]
-        );
+        // Position-dependent values: constant rows would hide a Q/K
+        // permutation defect. head_dim = 4 so the split-half and adjacent-pair
+        // layouts genuinely differ (they coincide at head_dim = 2).
+        let value = |len: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i * 13 + 7) % 17) as f32 / 17.0 - 0.4)
+                .collect()
+        };
+        // (HF name, HF shape [rows, cols]) for a one-layer dense model.
+        let tensors: [(&str, Vec<usize>); 12] = [
+            ("model.embed_tokens.weight", vec![4, 8]),
+            ("lm_head.weight", vec![4, 8]),
+            ("model.norm.weight", vec![8]),
+            ("model.layers.0.input_layernorm.weight", vec![8]),
+            ("model.layers.0.post_attention_layernorm.weight", vec![8]),
+            ("model.layers.0.self_attn.q_proj.weight", vec![8, 8]),
+            ("model.layers.0.self_attn.k_proj.weight", vec![4, 8]),
+            ("model.layers.0.self_attn.v_proj.weight", vec![4, 8]),
+            ("model.layers.0.self_attn.o_proj.weight", vec![8, 8]),
+            ("model.layers.0.mlp.gate_proj.weight", vec![16, 8]),
+            ("model.layers.0.mlp.up_proj.weight", vec![16, 8]),
+            ("model.layers.0.mlp.down_proj.weight", vec![8, 16]),
+        ];
+        for (index, (name, shape)) in tensors.into_iter().enumerate() {
+            write_f32_safetensors(
+                &dir.join(format!("shard-{index:02}.safetensors")),
+                name,
+                &shape,
+                &value(shape.iter().product()),
+            );
+        }
+        dir
+    }
+
+    /// Run the real conversion pipeline over a fixture directory.
+    fn convert_fixture(dir: &Path) -> std::path::PathBuf {
+        let loader = MlxModelLoader::new(dir).unwrap();
+        validate_model_config(&loader).unwrap();
+        let mut tensors = Vec::new();
+        let mut names = HashSet::new();
+        let mut offset = 0u64;
+        for name in loader.tensor_names() {
+            let meta = loader.tensor_meta(name.as_str()).unwrap();
+            let values = loader.load_tensor(name.as_str()).unwrap();
+            let values =
+                permute_llama_qk(name.as_str(), &meta.shape, values, loader.config.as_ref())
+                    .unwrap();
+            let canonical_name = canonical_tensor_name(name.as_str());
+            assert!(names.insert(canonical_name.clone()));
+            let format = tensor_quant_format(&meta.shape, NexusQuantFormat::FP32);
+            let quant_engine = QuantEngine::new(format, KvQuantType::None);
+            let data = quant_engine.quantize_weights(&values).unwrap();
+            let aligned = align(data.len(), ALIGNMENT);
+            tensors.push(ConvertedTensor {
+                name: canonical_name,
+                shape: meta.shape.clone(),
+                gguf_type: weight_data_type(format).unwrap().id(),
+                data,
+                offset,
+            });
+            offset += aligned as u64;
+        }
+        let metadata = build_metadata(&loader, dir, false).unwrap();
+        let output = dir.join("model.gguf");
+        write_gguf(&output, &metadata, &tensors).unwrap();
+        validate_written_gguf(&output, tensors.len()).unwrap();
+        output
+    }
+
+    fn engine_for_gguf(path: &Path) -> nexus::engine::InferenceEngine {
+        let mut engine =
+            nexus::engine::InferenceEngine::new(Some(nexus::engine::InferenceConfig {
+                allow_byte_tokenizer: true,
+                max_seq_len: 32,
+                ..Default::default()
+            }));
+        engine.load_model(path).unwrap();
+        engine
     }
 
     #[test]

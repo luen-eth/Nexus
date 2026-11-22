@@ -183,9 +183,15 @@ def inspect_gguf(path: Path) -> dict:
         return _inspect_stream(stream)
 
 
+# Architectures the inference engine can execute (must stay in sync with
+# ModelArch acceptance in src/engine/mod.rs load_model).
+SUPPORTED_ARCHITECTURES = frozenset({"llama", "mistral"})
+
+
 def _require_supported_architecture(architecture):
-    if isinstance(architecture, str) and architecture and architecture != "llama":
-        raise HubError(f"Nexus does not support the '{architecture[:128]}' architecture. Choose a compatible LLaMA GGUF model.")
+    if isinstance(architecture, str) and architecture and architecture not in SUPPORTED_ARCHITECTURES:
+        names = " or ".join(sorted(SUPPORTED_ARCHITECTURES))
+        raise HubError(f"Nexus does not support the '{architecture[:128]}' architecture. Choose a compatible {names} GGUF model.")
 
 
 def _delete_file_identity(root: Path, path: Path) -> tuple[int, int, int, int, int]:
@@ -869,7 +875,7 @@ class ModelHubPanel(QWidget):
         layout.addWidget(self.progress)
         self.status = self._label("Public repositories only. No Hugging Face account is required.", "hubStatus")
         layout.addWidget(self.status)
-        layout.addWidget(self._label("Compatibility: Nexus currently supports LLaMA architecture with full-head, unscaled RoPE. GGUF search results are not a compatibility guarantee. Weights expand to F32 in RAM/VRAM; a small download may need much more memory. Split GGUF files are not supported.", "notice"))
+        layout.addWidget(self._label("Compatibility: Nexus currently supports LLaMA and Mistral architectures with full-head, unscaled RoPE. GGUF search results are not a compatibility guarantee. Weights expand to F32 in RAM/VRAM; a small download may need much more memory. Split GGUF files are not supported.", "notice"))
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         layout.addWidget(line)
@@ -1096,13 +1102,13 @@ class ModelHubPanel(QWidget):
 
     def _file_selected(self, item, _previous=None):
         file = item.data(Qt.ItemDataRole.UserRole) if item else None
-        supported = bool(file and (not file.architecture or file.architecture == "llama"))
+        supported = bool(file and (not file.architecture or file.architecture in SUPPORTED_ARCHITECTURES))
         allowed = bool(file and supported and not file.split and 24 <= file.size <= self.client.MAX_FILE_BYTES)
         self.download_button.setEnabled(allowed and "download" not in self._jobs and not self.deletion_in_progress)
         if not file:
             return
         architecture = file.architecture or "unknown; compatibility is not verified"
-        if file.architecture and file.architecture != "llama":
+        if file.architecture and file.architecture not in SUPPORTED_ARCHITECTURES:
             architecture += " (not currently supported by Nexus)"
         integrity = "SHA-256 available" if file.sha256 else "Publisher SHA-256 unavailable; size and GGUF structure will be checked"
         suffix = " · Split file: unsupported" if file.split else ""
