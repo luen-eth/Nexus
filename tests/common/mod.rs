@@ -22,8 +22,12 @@ pub enum Value {
 
 impl TinyModel {
     /// Complete one-layer GQA transformer with deterministic, nontrivial weights.
+    ///
+    /// head_dim 4 keeps the adjacent-pair and split-half RoPE layouts
+    /// distinct (they coincide at head_dim 2, hiding permutation defects);
+    /// every real model family uses head_dim >= 32.
     pub fn new() -> Self {
-        Self::with_head_dim(2)
+        Self::with_head_dim(4)
     }
 
     pub fn with_head_dim(head_dim: usize) -> Self {

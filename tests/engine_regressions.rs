@@ -101,7 +101,11 @@ fn invalid_loads_fail_without_replacing_the_working_model() {
                     .insert("general.architecture".into(), Value::Text("qwen2".into()));
             }
             4 => model.tensors[0].2[0] = f32::NAN,
-            _ => model.tensors[0].1.reverse(),
+            // Reverse a deliberately non-square tensor's dims: at the default
+            // head_dim 4 the embedding tensor is square ([8, 8]) and reversing
+            // it is a no-op, while attn_k is [hidden, kv_dim] and must fail
+            // the loader's shape check.
+            _ => model.tensors[3].1.reverse(),
         }
         let file = tempfile::NamedTempFile::new().unwrap();
         model.write(file.path());
@@ -274,8 +278,15 @@ fn one_layer_gqa_logits_match_an_independent_scalar_reference() {
     // Reference: separate Python float64 RMSNorm -> Q/K/V -> split-half RoPE ->
     // GQA softmax attention -> residual -> SwiGLU -> residual -> output norm/head.
     // Uses the deterministic F32 fixture with prompt [0, 1, 2] and unquantized KV.
+    //
+    // Pinned to head_dim 2 on purpose: the expected constants were produced by
+    // that external script for this exact fixture, and at head_dim 2 the
+    // split-half and adjacent-pair RoPE layouts coincide, so this test gates
+    // the whole forward pass numerically. The RoPE *layout* itself is anchored
+    // at head_dim 4 against llama.cpp in
+    // `gguf_head_dim_four_logits_match_llama_cpp_cpu_f32`.
     let mut engine = engine(
-        &TinyModel::new(),
+        &TinyModel::with_head_dim(2),
         InferenceConfig {
             kv_quant: KvQuantType::None,
             ..Default::default()

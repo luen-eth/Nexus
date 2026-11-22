@@ -841,7 +841,8 @@ impl InferenceEngine {
                 .any(|tensor| tensor.name.ends_with(".bias"))
         {
             return Err(invalid(
-                "MoE, sliding-window and bias-bearing LLaMA graphs are not implemented".into(),
+                "MoE, sliding-window and bias-bearing llama/mistral graphs are not implemented"
+                    .into(),
             ));
         }
         let head_dim = hidden_size / num_heads;

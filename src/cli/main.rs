@@ -173,8 +173,9 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Quantization format
-        #[arg(long, default_value = "q4-0")]
+        /// Quantization format; defaults to a faithful F32 copy, lossy codecs
+        /// must be requested explicitly (same default as nexus-convert)
+        #[arg(long, default_value = "f32")]
         quant: String,
     },
 

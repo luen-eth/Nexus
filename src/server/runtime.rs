@@ -746,12 +746,16 @@ impl Drop for WorkerExitGuard {
         self.0.alive.store(false, Ordering::SeqCst);
         self.0.active.store(0, Ordering::SeqCst);
         self.0.active_kv_payload_bytes.store(0, Ordering::Relaxed);
-        // A dead worker can never complete a pending swap; leaving the flag
-        // set would report `model_swap_pending: true` in /metrics forever.
-        self.0.swap_pending.store(false, Ordering::SeqCst);
         let (jobs, installs) = {
             let mut queue = self.0.lock_queue();
             queue.shutdown = true;
+            // Reset inside the queue lock and after taking the installs: a
+            // concurrent loader that already passed the alive check can still
+            // store `swap_pending = true` before we take the lock; resetting
+            // before draining would let that late store win and report a
+            // pending swap on a dead worker forever. Late enqueues are
+            // rejected by `queue.shutdown` either way.
+            self.0.swap_pending.store(false, Ordering::SeqCst);
             (
                 std::mem::take(&mut queue.jobs),
                 std::mem::take(&mut queue.installs),

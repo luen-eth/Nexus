@@ -349,12 +349,12 @@ fn permute_llama_qk(
         || kv_heads == 0
         || heads % kv_heads != 0
     {
-        anyhow::bail!("Invalid LLaMA head dimensions");
+        anyhow::bail!("Invalid llama/mistral head dimensions");
     }
     let dim = hidden / heads;
     let rows_heads = if is_q { heads } else { kv_heads };
     if dim % 2 != 0 || shape.len() != 2 || shape[0] != rows_heads * dim || shape[1] != hidden {
-        anyhow::bail!("Invalid LLaMA Q/K shape for {name}: {shape:?}");
+        anyhow::bail!("Invalid llama/mistral Q/K shape for {name}: {shape:?}");
     }
     let cols = shape[1];
     let mut output = vec![0.; values.len()];
@@ -1216,47 +1216,50 @@ mod tests {
     }
     #[test]
     fn llama_qk_permutation_interleaves_hf_split_halves_per_head() {
+        // GQA geometry: 4 attention heads and 2 KV heads with head_dim 4, so
+        // the K side is exercised with more than one KV head (a K-only bug
+        // that only differs at kv_heads > 1 previously passed every test).
         // Mistral uses the same split-half RoPE pairing as LLaMA, so both
         // labels must produce the identical permutation.
         let configs = [
-            r#"{"model_type":"llama","hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1}"#,
-            r#"{"model_type":"mistral","hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1}"#,
+            r#"{"model_type":"llama","hidden_size":16,"num_attention_heads":4,"num_key_value_heads":2}"#,
+            r#"{"model_type":"mistral","hidden_size":16,"num_attention_heads":4,"num_key_value_heads":2}"#,
         ];
         for (index, config_json) in configs.iter().enumerate() {
             let config = nexus::mlx::MlxModelConfig::from_json(config_json).unwrap();
-            let q: Vec<f32> = (0..8).flat_map(|row| vec![row as f32; 8]).collect();
-            let k: Vec<f32> = (0..4).flat_map(|row| vec![row as f32; 8]).collect();
+            let q: Vec<f32> = (0..16).flat_map(|row| vec![row as f32; 16]).collect();
+            let k: Vec<f32> = (0..8).flat_map(|row| vec![row as f32; 16]).collect();
             let q = permute_llama_qk(
                 "model.layers.0.self_attn.q_proj.weight",
-                &[8, 8],
+                &[16, 16],
                 q,
                 Some(&config),
             )
             .unwrap();
             let k = permute_llama_qk(
                 "model.layers.0.self_attn.k_proj.weight",
-                &[4, 8],
+                &[8, 16],
                 k,
                 Some(&config),
             )
             .unwrap();
             assert_eq!(
-                q.as_chunks::<8>()
+                q.as_chunks::<16>()
+                    .0
+                    .iter()
+                    .map(|row| row[0])
+                    .collect::<Vec<_>>(),
+                vec![0., 2., 1., 3., 4., 6., 5., 7., 8., 10., 9., 11., 12., 14., 13., 15.],
+                "Q permutation for config {index}"
+            );
+            assert_eq!(
+                k.as_chunks::<16>()
                     .0
                     .iter()
                     .map(|row| row[0])
                     .collect::<Vec<_>>(),
                 vec![0., 2., 1., 3., 4., 6., 5., 7.],
-                "Q permutation for config {index}"
-            );
-            assert_eq!(
-                k.as_chunks::<8>()
-                    .0
-                    .iter()
-                    .map(|row| row[0])
-                    .collect::<Vec<_>>(),
-                vec![0., 2., 1., 3.],
-                "K permutation for config {index}"
+                "K permutation for config {index} must permute each KV head block"
             );
         }
     }
@@ -1268,25 +1271,43 @@ mod tests {
         // regression gate for the Q/K permutation gate: before it covered
         // mistral, the mistral file was written with unpermuted rows and
         // silently produced wrong attention.
-        let llama_dir = tiny_llm_fixture_dir("mistral-e2e-llama", "llama");
-        let mistral_dir = tiny_llm_fixture_dir("mistral-e2e-mistral", "mistral");
+        //
+        // This test compares two outputs of the same converter; the permuted
+        // layout itself is anchored externally by
+        // `gguf_head_dim_four_logits_match_llama_cpp_cpu_f32`
+        // (llama.cpp C++ reference) — the gate chain only holds because both
+        // tests exist. GQA geometry (kv_heads = 2) keeps a K-only permutation
+        // bug from passing.
+        let llama_dir = tiny_llm_fixture_dir("mistral-e2e-llama", "llama", false);
+        let mistral_dir = tiny_llm_fixture_dir("mistral-e2e-mistral", "mistral", false);
+        // Real Mistral-7B ships no lm_head.weight (tied embeddings): the tied
+        // resolution must yield the same logits as the explicit-head file.
+        let tied_dir = tiny_llm_fixture_dir("mistral-e2e-tied", "mistral", true);
         let llama_file = convert_fixture(&llama_dir);
         let mistral_file = convert_fixture(&mistral_dir);
+        let tied_file = convert_fixture(&tied_dir);
 
         let mut llama = engine_for_gguf(&llama_file);
         let mut mistral = engine_for_gguf(&mistral_file);
+        let mut tied = engine_for_gguf(&tied_file);
         for prompt in [[0u32, 1, 2], [3, 0, 1]] {
             assert_eq!(
                 llama.prefill(&prompt).unwrap(),
                 mistral.prefill(&prompt).unwrap(),
                 "converted output must not depend on the model_type label"
             );
+            assert_eq!(
+                mistral.prefill(&prompt).unwrap(),
+                tied.prefill(&prompt).unwrap(),
+                "tied embeddings must resolve to the same output head"
+            );
         }
-        fs::remove_dir_all(&llama_dir).unwrap();
-        fs::remove_dir_all(&mistral_dir).unwrap();
+        for dir in [&llama_dir, &mistral_dir, &tied_dir] {
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
-    fn tiny_llm_fixture_dir(tag: &str, model_type: &str) -> std::path::PathBuf {
+    fn tiny_llm_fixture_dir(tag: &str, model_type: &str, tied_head: bool) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "nexus-{tag}-{}-{}",
             std::process::id(),
@@ -1299,33 +1320,39 @@ mod tests {
         fs::write(
             dir.join("config.json"),
             format!(
-                r#"{{"model_type":"{model_type}","hidden_size":8,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":1,"intermediate_size":16,"vocab_size":4,"max_position_embeddings":32}}"#
+                r#"{{"model_type":"{model_type}","hidden_size":16,"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":2,"intermediate_size":32,"vocab_size":4,"max_position_embeddings":32}}"#
             ),
         )
         .unwrap();
         // Position-dependent values: constant rows would hide a Q/K
         // permutation defect. head_dim = 4 so the split-half and adjacent-pair
-        // layouts genuinely differ (they coincide at head_dim = 2).
+        // layouts genuinely differ (they coincide at head_dim = 2), and
+        // kv_heads = 2 so the K permutation exercises multiple KV heads.
         let value = |len: usize| -> Vec<f32> {
             (0..len)
                 .map(|i| ((i * 13 + 7) % 17) as f32 / 17.0 - 0.4)
                 .collect()
         };
-        // (HF name, HF shape [rows, cols]) for a one-layer dense model.
-        let tensors: [(&str, Vec<usize>); 12] = [
-            ("model.embed_tokens.weight", vec![4, 8]),
-            ("lm_head.weight", vec![4, 8]),
-            ("model.norm.weight", vec![8]),
-            ("model.layers.0.input_layernorm.weight", vec![8]),
-            ("model.layers.0.post_attention_layernorm.weight", vec![8]),
-            ("model.layers.0.self_attn.q_proj.weight", vec![8, 8]),
-            ("model.layers.0.self_attn.k_proj.weight", vec![4, 8]),
-            ("model.layers.0.self_attn.v_proj.weight", vec![4, 8]),
-            ("model.layers.0.self_attn.o_proj.weight", vec![8, 8]),
-            ("model.layers.0.mlp.gate_proj.weight", vec![16, 8]),
-            ("model.layers.0.mlp.up_proj.weight", vec![16, 8]),
-            ("model.layers.0.mlp.down_proj.weight", vec![8, 16]),
+        // (HF name, HF shape [rows, cols]) for a one-layer GQA model.
+        let mut tensors: Vec<(&str, Vec<usize>)> = vec![
+            ("model.embed_tokens.weight", vec![4, 16]),
+            ("model.norm.weight", vec![16]),
+            ("model.layers.0.input_layernorm.weight", vec![16]),
+            ("model.layers.0.post_attention_layernorm.weight", vec![16]),
+            ("model.layers.0.self_attn.q_proj.weight", vec![16, 16]),
+            ("model.layers.0.self_attn.k_proj.weight", vec![8, 16]),
+            ("model.layers.0.self_attn.v_proj.weight", vec![8, 16]),
+            ("model.layers.0.self_attn.o_proj.weight", vec![16, 16]),
+            ("model.layers.0.mlp.gate_proj.weight", vec![32, 16]),
+            ("model.layers.0.mlp.up_proj.weight", vec![32, 16]),
+            ("model.layers.0.mlp.down_proj.weight", vec![16, 32]),
         ];
+        if !tied_head {
+            // Byte-identical to the embedding (same generator and length), so
+            // the tied-vs-explicit comparison below is maximally sensitive to
+            // how the engine resolves the output head.
+            tensors.push(("lm_head.weight", vec![4, 16]));
+        }
         for (index, (name, shape)) in tensors.into_iter().enumerate() {
             write_f32_safetensors(
                 &dir.join(format!("shard-{index:02}.safetensors")),
