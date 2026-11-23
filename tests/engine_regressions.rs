@@ -100,12 +100,28 @@ fn invalid_loads_fail_without_replacing_the_working_model() {
                     .metadata
                     .insert("general.architecture".into(), Value::Text("qwen2".into()));
             }
-            4 => model.tensors[0].2[0] = f32::NAN,
-            // Reverse a deliberately non-square tensor's dims: at the default
-            // head_dim 4 the embedding tensor is square ([8, 8]) and reversing
-            // it is a no-op, while attn_k is [hidden, kv_dim] and must fail
-            // the loader's shape check.
-            _ => model.tensors[3].1.reverse(),
+            4 => {
+                // Target tensors by name: indexing the list makes the defect
+                // silently migrate to another tensor if the fixture order
+                // ever changes.
+                let tensor = model
+                    .tensors
+                    .iter_mut()
+                    .find(|(name, _, _)| name == "token_embd.weight")
+                    .expect("fixture token_embd");
+                tensor.2[0] = f32::NAN;
+            }
+            _ => {
+                // Reverse a deliberately non-square tensor's dims: the
+                // embedding is square at head_dim 4, while attn_k is
+                // [hidden, kv_dim] and must fail the loader's shape check.
+                let tensor = model
+                    .tensors
+                    .iter_mut()
+                    .find(|(name, _, _)| name == "blk.0.attn_k.weight")
+                    .expect("fixture attn_k");
+                tensor.1.reverse();
+            }
         }
         let file = tempfile::NamedTempFile::new().unwrap();
         model.write(file.path());

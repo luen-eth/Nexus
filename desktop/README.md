@@ -28,7 +28,7 @@ The library directory is the saved `models_dir` setting, otherwise `NEXUS_MODELS
 
 A GGUF search result or successful download does not guarantee that Nexus can run the model. Current support requires a compatible LLaMA or Mistral architecture, full-head unscaled RoPE, tokenizer, and tensor formats; the server performs final validation when loading. Split GGUF models are rejected. Runtime weights expand to F32, so compressed download size is not a RAM or VRAM requirement. Check the [validation notes](../docs/validation.md) before choosing larger models.
 
-Known unsupported architectures reported by Hugging Face, such as `gemma4`, cannot be downloaded through the model browser. Missing architecture metadata is shown as unknown, not compatible. Local files are inspected before a Models-page load request; an unsupported architecture is rejected with guidance. These checks do not add inference support for that architecture or guarantee all LLaMA variants will run.
+Known unsupported architectures reported by Hugging Face, such as `gemma4`, cannot be downloaded through the model browser. Missing architecture metadata is shown as unknown, not compatible. Local files are inspected before a Models-page load request; an unsupported architecture is rejected with guidance. These checks do not add inference support for that architecture or guarantee all llama or mistral variants will run.
 
 ## Development
 

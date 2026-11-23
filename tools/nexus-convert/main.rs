@@ -193,7 +193,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The current runtime and HF transforms are implemented for dense LLaMA only.
+/// The current runtime and HF transforms are implemented for dense llama/mistral only.
 fn validate_model_config(loader: &MlxModelLoader) -> Result<()> {
     let config = loader
         .config
@@ -269,14 +269,14 @@ fn validate_model_config(loader: &MlxModelLoader) -> Result<()> {
         || !heads.is_multiple_of(kv)
         || !(hidden / heads).is_multiple_of(2)
     {
-        anyhow::bail!("Invalid LLaMA attention dimensions");
+        anyhow::bail!("Invalid llama/mistral attention dimensions");
     }
     if config.rope_theta.is_some_and(|v| !v.is_finite() || v <= 0.)
         || config
             .rms_norm_eps
             .is_some_and(|v| !v.is_finite() || v <= 0.)
     {
-        anyhow::bail!("Invalid LLaMA rope_theta/rms_norm_eps");
+        anyhow::bail!("Invalid llama/mistral rope_theta/rms_norm_eps");
     }
     Ok(())
 }
@@ -1056,6 +1056,17 @@ mod tests {
             canonical_tensor_name("model.layers.1.mlp.down_proj.weight"),
             "blk.1.ffn_down.weight"
         );
+    }
+
+    #[test]
+    fn default_quantization_is_a_faithful_f32_copy() {
+        // The wrapper and the tool must keep the same lossless default; a
+        // silent revert to a lossy codec would ship visibly degraded models.
+        let cli = Cli::try_parse_from(["nexus-convert", "-i", "a", "-o", "b"]).unwrap();
+        assert!(matches!(cli.quant, QuantFormat::F32));
+        let lossy = Cli::try_parse_from(["nexus-convert", "-i", "a", "-o", "b", "--quant", "q4-0"])
+            .unwrap();
+        assert!(matches!(lossy.quant, QuantFormat::Q4_0));
     }
 
     #[test]

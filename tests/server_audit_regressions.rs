@@ -505,6 +505,150 @@ async fn bearer_scheme_matching_is_case_insensitive() {
 }
 
 #[tokio::test]
+async fn cors_headers_require_an_explicit_origin() {
+    // A permissive `*` default made the no-auth loopback server readable
+    // from any web page in browsers that do not enforce Private Network
+    // Access; without NEXUS_CORS_ORIGIN there must be no CORS headers at all.
+    let server = TestServer::new("audit-A", false, options()).await;
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let response = http
+        .get(format!("{}/v1/models", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
+    let response = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/v1/chat/completions", server.base),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    assert!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "an unconfigured preflight must not invite browsers in"
+    );
+
+    // An explicitly configured origin still gets full CORS support.
+    let server = TestServer::new_with_config(
+        "audit-A",
+        false,
+        options(),
+        ServerConfig {
+            api_key: None,
+            cors_origin: Some("https://example.test".into()),
+            rate_limit_per_minute: None,
+        },
+    )
+    .await;
+    let response = http
+        .get(format!("{}/v1/models", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["access-control-allow-origin"],
+        "https://example.test"
+    );
+}
+
+#[tokio::test]
+async fn fifo_model_paths_are_rejected_before_wedging_the_loader() {
+    // Opening a FIFO blocks the loader thread forever and wedges every
+    // model-lifecycle endpoint behind the lifecycle guard; the precheck must
+    // reject it before enqueueing.
+    let server = TestServer::new("audit-A", false, options()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("trap.fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success(), "this test requires mkfifo");
+    let response = server
+        .post(
+            "/v1/model/load",
+            json!({"model": fifo.display().to_string()}),
+        )
+        .await;
+    assert_eq!(response.status(), 400);
+    assert!(body(response).await["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("regular file"));
+    // The lifecycle and the serving model stay healthy afterwards.
+    let response = server
+        .post(
+            "/v1/completions",
+            json!({"model":"audit-A","prompt":"x","max_tokens":2}),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(body(response).await["choices"][0]["text"], "aa");
+}
+
+#[tokio::test]
+async fn a_whitespace_api_key_is_never_a_livable_secret() {
+    // `--api-key " "` (a pasted space) previously enabled auth with " " as
+    // the secret; a client sending a matching whitespace key had to pass.
+    for bad_key in ["", " "] {
+        let server = TestServer::new_with_config(
+            "audit-A",
+            false,
+            options(),
+            ServerConfig {
+                api_key: Some(bad_key.into()),
+                cors_origin: None,
+                rate_limit_per_minute: None,
+            },
+        )
+        .await;
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let url = format!("{}/v1/models", server.base);
+        assert_eq!(
+            http.get(&url)
+                .header("x-api-key", bad_key)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            401,
+            "key {bad_key:?}"
+        );
+        assert_eq!(
+            http.get(&url)
+                .header("authorization", format!("Bearer {bad_key}"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            401,
+            "key {bad_key:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn oversized_stop_payloads_are_rejected_before_reaching_the_worker() {
     let server = TestServer::new("audit-A", false, options()).await;
     let seventeen_stops: Vec<&str> = vec!["a"; 17];

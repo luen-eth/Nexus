@@ -163,7 +163,7 @@ Start a local server:
   --batch-size 4
 ```
 
-Add `--backend cuda` when using a CUDA-enabled build. The default listener is loopback. Authentication, CORS and request limits are configured through `NEXUS_API_KEY`, `NEXUS_CORS_ORIGIN` and `NEXUS_RATE_LIMIT_PER_MINUTE`, or the matching CLI flags.
+Add `--backend cuda` when using a CUDA-enabled build. The default listener is loopback. Authentication and request limits are configured through `NEXUS_API_KEY` and `NEXUS_RATE_LIMIT_PER_MINUTE`, or the matching CLI flags. Browser cross-origin access is disabled unless `NEXUS_CORS_ORIGIN` names an allowed origin, so web pages cannot drive a local no-auth server. A streaming client that stops reading is cancelled after 30 seconds (`stream_stall_timeout`), which keeps one stalled consumer from holding a generation slot.
 
 Find the served model's `id`, then use it in a request:
 

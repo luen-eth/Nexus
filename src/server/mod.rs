@@ -177,6 +177,7 @@ impl ServerConfig {
     pub fn from_env() -> Self {
         let api_key = std::env::var("NEXUS_API_KEY")
             .ok()
+            .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let cors_origin = std::env::var("NEXUS_CORS_ORIGIN")
             .ok()
@@ -569,12 +570,15 @@ fn is_public_path(path: &str) -> bool {
 }
 
 fn authorized(req: &Request<Body>, api_key: &str) -> bool {
-    if api_key.is_empty() {
-        // Defense in depth: an empty configured secret must never authorize
-        // an empty client key, even if a caller bypassed startup validation.
+    if api_key.trim().is_empty() {
+        // Defense in depth: an empty or whitespace-only configured secret
+        // must never authorize a matching client key, even if a caller
+        // bypassed startup validation.
         return false;
     }
     // RFC 7235: the auth scheme is case-insensitive (`bearer`, `Bearer`, ...).
+    // Credentials are trimmed: clients that paste keys with stray
+    // whitespace must not be locked out by an invisible trailing space.
     let bearer = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -583,12 +587,13 @@ fn authorized(req: &Request<Body>, api_key: &str) -> bool {
             let (scheme, credentials) = value.split_once(char::is_whitespace)?;
             scheme
                 .eq_ignore_ascii_case("bearer")
-                .then(|| credentials.trim_start())
+                .then(|| credentials.trim())
         });
     let x_api_key = req
         .headers()
         .get("x-api-key")
-        .and_then(|value| value.to_str().ok());
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
     bearer
         .or(x_api_key)
         .is_some_and(|candidate| constant_time_eq(candidate.as_bytes(), api_key.as_bytes()))
@@ -605,7 +610,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn add_cors_headers(state: &ServerState, response: &mut Response) {
-    let origin = state.server_config.cors_origin.as_deref().unwrap_or("*");
+    // Emit CORS headers only when an operator explicitly configured an
+    // origin. A permissive `*` default lets any web page drive a no-auth
+    // loopback server from browsers that do not enforce Private/Local
+    // Network Access: silent compute theft, model unload, remote path
+    // probing. Native clients (CLI, desktop app) never need CORS.
+    let Some(origin) = state.server_config.cors_origin.as_deref() else {
+        return;
+    };
     if let Ok(value) = HeaderValue::from_str(origin) {
         response
             .headers_mut()
@@ -1082,12 +1094,31 @@ fn lifecycle_response(status: &str, snapshot: &ModelSnapshot) -> Json<serde_json
 /// Load a model. The new engine is built off the reactor; it replaces the
 /// current one only after it loaded successfully (a failed load keeps the
 /// existing model) and only once in-flight sequences on the old model finish.
+/// Model paths cross a trust boundary: opening a FIFO blocks the loader
+/// thread forever (wedging every model-lifecycle endpoint behind
+/// `lifecycle_guard`), and other special files fail with confusing
+/// mid-parse errors. Only regular files (symlinks to them included) may be
+/// enqueued to the loader.
+fn ensure_regular_model_file(path: &std::path::Path) -> Result<(), ApiError> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| ApiError::bad_request(format!("Model file is not accessible: {err}")))?;
+    if !metadata.is_file() {
+        return Err(ApiError::bad_request(
+            "Model path must be a regular file; FIFOs and devices are rejected",
+        ));
+    }
+    Ok(())
+}
+
 async fn load_model(
     State(state): State<ServerState>,
     Json(req): Json<ModelLoadRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let _lifecycle = state.runtime.lifecycle_guard().await;
     let config = config_from_load_request(&req, state.runtime.snapshot().requested_config.clone())?;
+    // Reject special files before the loader thread ever opens them: a FIFO
+    // would block it forever and wedge every lifecycle endpoint.
+    ensure_regular_model_file(&req.model)?;
     let engine = build_engine(&state.model_loader, req.model.clone(), config.clone()).await?;
     let snapshot = state
         .runtime
@@ -1106,6 +1137,9 @@ async fn reload_model(
             "No previously loaded model path to reload",
         ));
     };
+    // The stored path was operator-supplied once; the file behind it may
+    // since have been replaced by a FIFO or other special file.
+    ensure_regular_model_file(&path)?;
     let config = current.requested_config.clone();
     let engine = build_engine(&state.model_loader, path.clone(), config.clone()).await?;
     let snapshot = state

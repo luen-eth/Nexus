@@ -190,7 +190,11 @@ pub fn sigmoid_glu_ffn(
 /// Compute RMS normalization.
 pub fn rms_norm(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let dim = input.len();
-    let variance = input.iter().map(|x| x * x).sum::<f32>() / dim as f32;
+    // Accumulate the mean of squares in f64: in f32 it overflows to +inf for
+    // |x| > ~1.9e19 (possible for adversarial-but-valid GGUF weights), which
+    // silently produces an all-zero output instead of an error.
+    let variance =
+        (input.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / dim as f64) as f32;
     let rstd = 1.0 / (variance + eps).sqrt();
 
     let mut output = vec![0.0f32; dim];
@@ -204,11 +208,21 @@ pub fn rms_norm(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
 pub fn layer_norm(input: &[f32], weight: &[f32], bias: Option<&[f32]>, eps: f32) -> Vec<f32> {
     let dim = input.len();
 
+    // Accumulate in f64 like rms_norm: f32 mean/variance overflow to
+    // inf/NaN for adversarial-but-finite inputs and silently poison the
+    // output instead of failing.
     // Compute mean
-    let mean: f32 = input.iter().sum::<f32>() / dim as f32;
+    let mean = (input.iter().map(|x| *x as f64).sum::<f64>() / dim as f64) as f32;
 
     // Compute variance
-    let variance: f32 = input.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / dim as f32;
+    let variance = (input
+        .iter()
+        .map(|x| {
+            let delta = *x as f64 - mean as f64;
+            delta * delta
+        })
+        .sum::<f64>()
+        / dim as f64) as f32;
 
     // Normalize and apply scale/bias
     let mut output = vec![0.0f32; dim];

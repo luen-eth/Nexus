@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     // Parse configuration
     let kv_quant_type = KvQuantType::from_str(&cli.kv_quant.to_ascii_lowercase().replace('-', "_"))
@@ -110,12 +110,21 @@ async fn main() -> Result<()> {
     }
     // An empty --api-key usually means an unset environment variable in a
     // script; treating it as "authentication enabled with an empty secret"
-    // would authorize any client that sends an empty key header.
-    if cli.api_key.as_ref().is_some_and(|key| key.is_empty()) {
+    // would authorize any client that sends an empty key header. The same
+    // holds for whitespace-only keys (pasted with a stray space), so reject
+    // everything that is empty after trimming.
+    if cli
+        .api_key
+        .as_ref()
+        .is_some_and(|key| key.trim().is_empty())
+    {
         return Err(anyhow!(
-            "--api-key must not be empty; unset it to serve without authentication"
+            "--api-key must not be empty or whitespace; unset it to serve without authentication"
         ));
     }
+    // Store the trimmed secret: clients send the exact key, and a
+    // trailing-space paste must not silently change what clients must send.
+    cli.api_key = cli.api_key.map(|key| key.trim().to_string());
 
     let config = InferenceConfig {
         max_seq_len: cli.ctx_size,

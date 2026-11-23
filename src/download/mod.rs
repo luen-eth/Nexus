@@ -27,58 +27,61 @@ impl ModelRepo {
     }
 }
 
-/// Predefined small models (~1B parameters) for testing
+/// Predefined llama/mistral-architecture GGUF models for the CLI catalog.
+/// The engine rejects every other architecture, so each entry must be a
+/// single-file GGUF the loader can actually run; safetensors/MLX shards are
+/// conversion inputs, not loadable models.
 pub fn available_models() -> Vec<ModelRepo> {
     vec![
         ModelRepo::new(
-            "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-            "qwen2.5-1.5b-instruct-q4_k_m.gguf",
-            "Qwen 2.5 1.5B - Q4_K_M quantization",
+            "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+            "tinyllama-1.1b-chat-v1.0.Q2_K.gguf",
+            "TinyLlama 1.1B Chat (llama) - Q2_K quantization (smallest)",
         ),
         ModelRepo::new(
-            "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-            "qwen2.5-1.5b-instruct-q5_k_m.gguf",
-            "Qwen 2.5 1.5B - Q5_K_M quantization",
+            "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+            "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+            "TinyLlama 1.1B Chat (llama) - Q4_K_M quantization",
         ),
         ModelRepo::new(
-            "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-            "qwen2.5-1.5b-instruct-q6_k.gguf",
-            "Qwen 2.5 1.5B - Q6_K quantization",
+            "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+            "tinyllama-1.1b-chat-v1.0.Q5_K_M.gguf",
+            "TinyLlama 1.1B Chat (llama) - Q5_K_M quantization",
         ),
         ModelRepo::new(
-            "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-            "qwen2.5-1.5b-instruct-q8_0.gguf",
-            "Qwen 2.5 1.5B - Q8_0 quantization",
+            "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+            "tinyllama-1.1b-chat-v1.0.Q6_K.gguf",
+            "TinyLlama 1.1B Chat (llama) - Q6_K quantization",
         ),
         ModelRepo::new(
-            "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-            "qwen2.5-1.5b-instruct-q2_k.gguf",
-            "Qwen 2.5 1.5B - Q2_K quantization (smallest)",
+            "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+            "tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
+            "TinyLlama 1.1B Chat (llama) - Q8_0 quantization",
         ),
         ModelRepo::new(
-            "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-            "qwen2.5-1.5b-instruct-q3_k_m.gguf",
-            "Qwen 2.5 1.5B - Q3_K_M quantization",
+            "TheBloke/Llama-2-7B-Chat-GGUF",
+            "llama-2-7b-chat.Q2_K.gguf",
+            "Llama 2 7B Chat - Q2_K quantization",
         ),
         ModelRepo::new(
-            "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-            "qwen2.5-1.5b-instruct-q3_k_s.gguf",
-            "Qwen 2.5 1.5B - Q3_K_S quantization",
+            "TheBloke/Llama-2-7B-Chat-GGUF",
+            "llama-2-7b-chat.Q4_K_M.gguf",
+            "Llama 2 7B Chat - Q4_K_M quantization",
         ),
         ModelRepo::new(
-            "bartowski/Qwen2.5-1.5B-Instruct-GGUF",
-            "qwen2.5-1.5b-instruct-iq2_xs.gguf",
-            "Qwen 2.5 1.5B - IQ2_XS (extreme quantization)",
+            "TheBloke/Llama-2-7B-Chat-GGUF",
+            "llama-2-7b-chat.Q8_0.gguf",
+            "Llama 2 7B Chat - Q8_0 quantization",
         ),
         ModelRepo::new(
-            "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
-            "model.safetensors",
-            "Qwen 2.5 1.5B - MLX 4-bit quantized (safetensors)",
+            "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+            "mistral-7b-instruct-v0.2.Q2_K.gguf",
+            "Mistral 7B Instruct v0.2 - Q2_K quantization",
         ),
         ModelRepo::new(
-            "mlx-community/Qwen2.5-1.5B-Instruct-8bit",
-            "model.safetensors",
-            "Qwen 2.5 1.5B - MLX 8-bit quantized (safetensors)",
+            "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+            "mistral-7b-instruct-v0.2.Q4_K_M.gguf",
+            "Mistral 7B Instruct v0.2 - Q4_K_M quantization",
         ),
     ]
 }
@@ -350,6 +353,32 @@ pub fn models_dir(base_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_only_lists_loadable_single_file_ggufs() {
+        // The engine runs llama/mistral only, and safetensors/MLX shards are
+        // conversion inputs: every catalog entry must stay a single-file GGUF
+        // under a real owner/repository (the previous catalog was 10/10
+        // Qwen2.5 — an architecture the loader categorically rejects).
+        let models = available_models();
+        assert!(!models.is_empty());
+        for model in &models {
+            assert!(model.filename.ends_with(".gguf"), "{}", model.filename);
+            assert_eq!(model.repo_id.split('/').count(), 2, "{}", model.repo_id);
+        }
+        assert!(
+            models
+                .iter()
+                .any(|m| m.repo_id.to_lowercase().contains("llama")),
+            "the catalog must offer a llama-architecture model"
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m.repo_id.to_lowercase().contains("mistral")),
+            "the catalog must offer a mistral-architecture model"
+        );
+    }
     use std::net::TcpListener;
 
     fn http_fixture(responses: Vec<Vec<u8>>) -> (String, std::thread::JoinHandle<()>) {
