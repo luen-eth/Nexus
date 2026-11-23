@@ -484,6 +484,43 @@ def list_local_models(root: Path) -> list[Path]:
     return sorted(found, key=lambda p: str(p).lower())
 
 
+def sweep_orphaned_parts(models_root: Path, logo_dir: Path) -> int:
+    """Delete crash-orphaned .part files older than a day; fresh ones may be in use."""
+    cutoff = time.time() - 24 * 60 * 60
+    removed = 0
+
+    def sweep(folder, prefix, depth=0, budget=[5000]):
+        nonlocal removed
+        folder = Path(folder)
+        if budget[0] <= 0 or folder.is_symlink() or not folder.is_dir():
+            return
+        try:
+            with os.scandir(folder) as scan:
+                entries = list(scan)
+        except OSError:
+            return
+        for entry in entries:
+            if budget[0] <= 0:
+                break
+            budget[0] -= 1
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False) and depth < 20:
+                    sweep(Path(entry.path), prefix, depth + 1)
+                elif (entry.is_file(follow_symlinks=False)
+                        and entry.name.startswith(prefix) and entry.name.endswith(".part")
+                        and entry.stat(follow_symlinks=False).st_mtime < cutoff):
+                    os.unlink(entry.path)
+                    removed += 1
+            except OSError:
+                continue
+
+    sweep(models_root, ".nexus-download-")
+    sweep(logo_dir, ".logo-")
+    return removed
+
+
 def _allowed_logo_url(url: str, allow_local_http=False):
     """Avatar URLs must come from a profile API and stay on these HF hosts."""
     p = urlsplit(url)
@@ -810,6 +847,9 @@ class ModelHubPanel(QWidget):
         self._build_ui()
         if self.controller is not None:
             self.controller.changed.connect(self._controller_changed)
+        removed = sweep_orphaned_parts(self.download_dir, self.logo_cache.cache_dir)
+        if removed:
+            self.status.setText(f"Removed {removed} abandoned temporary file{'s' if removed > 1 else ''} from a previous session.")
         self.refresh_local()
 
     @staticmethod

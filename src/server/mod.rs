@@ -388,12 +388,13 @@ impl RateLimiter {
     /// Record a request from `peer` and report whether it is allowed.
     /// Without a known peer address all such requests share one bucket.
     fn check(&self, peer: Option<IpAddr>, now: Instant) -> bool {
-        let Some(limit) = self.limit else {
+        // `0` means "no limit", matching the documented compose guidance
+        // (set `NEXUS_RATE_LIMIT_PER_MINUTE=0` when a fronting proxy enforces
+        // its own limit); the previous hard deny-all made the documented
+        // value lock every client out.
+        let Some(limit) = self.limit.filter(|limit| *limit > 0) else {
             return true;
         };
-        if limit == 0 {
-            return false;
-        }
         let key = peer
             .map(rate_limit_key)
             .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
@@ -515,12 +516,26 @@ pub fn create_router(state: ServerState) -> Router {
 }
 
 /// Serve the API on an already-bound listener, exposing peer addresses.
+/// Runs until the process is torn down (tests use this form).
 pub async fn serve(listener: tokio::net::TcpListener, state: ServerState) -> std::io::Result<()> {
+    serve_with_shutdown(listener, state, std::future::pending::<()>()).await
+}
+
+/// Serve until `shutdown` resolves: the listener stops accepting, idle
+/// connections close, and in-flight requests get the axum grace window to
+/// complete. A SIGTERM can therefore drain instead of cutting every stream
+/// mid-token.
+pub async fn serve_with_shutdown(
+    listener: tokio::net::TcpListener,
+    state: ServerState,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let app = create_router(state);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown)
     .await
 }
 
@@ -1387,6 +1402,31 @@ pub async fn run_server_with_config(
     .await
 }
 
+/// Serve until the process is asked to stop, then drain within a bounded
+/// window. Long SSE streams do not end on their own, so the drain window
+/// bounds total shutdown time (docker's `stop_grace_period: 30s` matches
+/// the 25-second window with headroom before the runtime escalates).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+}
+
 pub async fn run_server_with_requested_config(
     engine: InferenceEngine,
     host: &str,
@@ -1432,7 +1472,15 @@ pub async fn run_server_with_requested_config(
     println!();
 
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
-    serve(listener, state).await?;
+    let drain = serve_with_shutdown(listener, state, shutdown_signal());
+    match tokio::time::timeout(std::time::Duration::from_secs(25), drain).await {
+        Ok(result) => result?,
+        Err(_) => {
+            // In-flight streams that ignore the grace window (long SSE
+            // generations) are released here so shutdown stays bounded.
+            println!("Shutdown drain window elapsed; closing remaining connections.");
+        }
+    }
 
     Ok(())
 }
@@ -1677,6 +1725,34 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(serve(listener, state.clone()));
         (base, state)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_with_shutdown_stops_accepting_on_signal() {
+        // SIGTERM previously killed in-flight requests instantly (measured
+        // < 1 s in the smoke audit, with no [DONE]); the shutdown future
+        // must let the listener drain instead.
+        let (base, state) =
+            start(layered_fixture("shutdown", 7), options(2, 8), open_config()).await;
+        let http = client();
+        let health = http.get(format!("{base}/health")).send().await.unwrap();
+        assert_eq!(health.status(), 200);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = format!("http://{}", listener.local_addr().unwrap());
+        let (trigger, shutdown) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(serve_with_shutdown(listener, state, async move {
+            let _ = shutdown.await;
+        }));
+        let probe = http.get(format!("{second}/health")).send().await.unwrap();
+        assert_eq!(probe.status(), 200);
+        trigger.send(()).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert!(
+            outcome.is_ok(),
+            "serve must return after the shutdown signal"
+        );
+        assert!(outcome.unwrap().unwrap().is_ok());
     }
 
     fn client() -> reqwest::Client {
@@ -2022,9 +2098,23 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
+    fn a_zero_rate_limit_means_unlimited() {
+        // Compose documents `NEXUS_RATE_LIMIT_PER_MINUTE=0` as the way to
+        // disable the limiter behind a fronting proxy; the limiter must not
+        // turn that documented value into a deny-all for every client.
+        let limiter = RateLimiter::new(Some(0), Duration::from_secs(60));
+        let peer = Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let t0 = Instant::now();
+        for _ in 0..100 {
+            assert!(limiter.check(peer, t0), "0 must disable the limit");
+        }
+    }
+
+    #[test]
     fn rate_limiter_keys_by_peer_and_evicts_idle_clients() {
         let limiter = RateLimiter::new(Some(2), Duration::from_secs(60));
         let t0 = Instant::now();
+
         let a: IpAddr = "10.0.0.1".parse().unwrap();
         let b: IpAddr = "10.0.0.2".parse().unwrap();
         assert!(limiter.check(Some(a), t0));
@@ -2428,11 +2518,13 @@ mod tests {
             .unwrap();
         assert_eq!(body["choices"][0]["text"], "Hé");
         assert_eq!(body["choices"][0]["finish_reason"], "stop");
-        // Usage counts tokenizer output, not visible UTF-8 characters or SSE
-        // deltas; the withheld stop sequence is excluded just as in a whole response.
+        // Usage counts generated tokens at the moment the stop matched,
+        // including the withheld stop tail — the llama.cpp/OpenAI convention
+        // for `finish_reason: "stop"` (the previous implementation excluded
+        // the tail via a quadratic re-decode scan).
         assert_eq!(body["usage"]["prompt_tokens"], 1);
-        assert_eq!(body["usage"]["completion_tokens"], 3);
-        assert_eq!(body["usage"]["total_tokens"], 4);
+        assert_eq!(body["usage"]["completion_tokens"], 6);
+        assert_eq!(body["usage"]["total_tokens"], 7);
         assert_eq!(chunks.last().unwrap()["usage"], body["usage"]);
         assert!(chunks[..chunks.len() - 1]
             .iter()
@@ -2696,8 +2788,17 @@ mod tests {
         };
         wait_until("swap pending", || runtime.stats().model_swap_pending).await;
 
-        // New work queues behind the swap instead of running on the old model.
-        let after = runtime.submit(text_request("after", "b", 3)).unwrap();
+        // New submissions during a pending swap fail fast with Busy instead
+        // of queueing indefinitely behind the drain of active sequences.
+        // (This is the inverted gate: the test previously pinned the
+        // queue-and-hang behavior as expected.)
+        let rejection = runtime.submit(text_request("after", "b", 3));
+        let err = rejection.expect_err("the swap window must reject instead of queueing");
+        assert_eq!(err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.message.contains("Model swap in progress"),
+            "message: {err}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             !installer.is_finished(),
@@ -2705,7 +2806,7 @@ mod tests {
         );
         let snapshot = runtime.snapshot();
         assert_eq!((snapshot.name.as_str(), snapshot.epoch), ("model-a", 0));
-        assert_eq!(runtime.stats().queued, 1);
+        assert_eq!(runtime.stats().queued, 0);
 
         // The in-flight sequence completes entirely on model A.
         assert!(
@@ -2723,10 +2824,16 @@ mod tests {
         assert!(!runtime.stats().model_swap_pending);
         assert_eq!(runtime.scheduler().kv_page_stats().1, 2); // 32 tokens / 16 per page * 1 slot
 
-        // The queued request is tokenized, generated and labelled by model B.
-        let output = after.await.unwrap().unwrap();
-        assert_eq!(output.model, "model-b");
-        assert_eq!(output.text, "bbb");
+        // After the swap completes, a fresh request is tokenized, generated
+        // and labelled by model B.
+        let after = runtime
+            .submit(text_request("after", "b", 3))
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.model, "model-b");
+        assert_eq!(after.text, "bbb");
     }
 
     fn push_u32(out: &mut Vec<u8>, value: u32) {

@@ -648,6 +648,18 @@ impl Runtime {
         if queue.shutdown || !self.shared.alive.load(Ordering::SeqCst) {
             return Err(RuntimeError::unavailable());
         }
+        if self.shared.swap_pending.load(Ordering::SeqCst) {
+            // Failing fast instead of queueing: a queued job would hang
+            // behind the swap for the whole drain of active sequences, with
+            // no deadline and no feedback to the HTTP client.
+            self.shared
+                .rejected_busy_total
+                .fetch_add(1, Ordering::SeqCst);
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::Busy,
+                "Model swap in progress; retry when the new model is loaded",
+            ));
+        }
         if queue.jobs.len() >= self.shared.options.max_pending {
             self.shared
                 .rejected_busy_total
@@ -778,6 +790,10 @@ struct ActiveSeq {
     stalled_since: Option<Instant>,
     stop_strings: Vec<String>,
     stopped_text: Option<String>,
+    /// Tokens generated at the moment a text stop matched, captured here so
+    /// the finish path never needs to re-decode the completion to recover a
+    /// token count (the previous prefix scan was quadratic on the worker).
+    stopped_tokens: Option<usize>,
 }
 
 enum StepOutcome {
@@ -922,10 +938,27 @@ impl Worker {
             reply.fail(err);
             return;
         }
-        let (prompt, generation) = match self.prepare(&request) {
-            Ok(prepared) => prepared,
-            Err(err) => {
+        // Tokenizer render/encode work stays panic-guarded: a latent panic in
+        // chat-template rendering or encoding must fail this request, not
+        // kill the worker for the whole process (the worker has no respawn
+        // path, so an unguarded panic would 503 every later request).
+        let prepared = catch_unwind(AssertUnwindSafe(|| self.prepare(&request)));
+        let (prompt, generation) = match prepared {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(err)) => {
                 reply.fail(err);
+                return;
+            }
+            Err(panic) => {
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                reply.fail(RuntimeError::new(
+                    RuntimeErrorKind::Internal,
+                    format!("Tokenizer error: {message}"),
+                ));
                 return;
             }
         };
@@ -985,6 +1018,7 @@ impl Worker {
             stalled_since: None,
             stop_strings: request.stop,
             stopped_text: None,
+            stopped_tokens: None,
         });
         self.shared
             .active
@@ -1165,23 +1199,33 @@ impl Worker {
             // Revision-prone streaming decoders also flush only at completion.
             return StepOutcome::Keep { progressed: true };
         }
-        let decoded = match safe_text(
-            &self.tokenizer,
-            seq.session.visible_output(),
-            seq.session.finished,
-        ) {
-            Ok(text) => text,
-            Err(err) => {
-                take_reply(&mut seq.reply).fail(RuntimeError::new(RuntimeErrorKind::Internal, err));
-                return StepOutcome::Remove;
+        // Tokenizer decode and the stop scan stay panic-guarded: a latent
+        // decode panic must fail this request, not kill the worker thread
+        // for the whole process. Stops terminate on the current decoded
+        // prefix, even if streaming is buffered; once matched, no future
+        // token can revise that prefix.
+        let (visible, matched) = {
+            let stop_strings = &seq.stop_strings;
+            let finished = seq.session.finished;
+            let output = seq.session.visible_output();
+            match tokenizer_guard(|| {
+                let decoded = safe_text(&self.tokenizer, output, finished)?;
+                let (visible, matched) = filter_stop_text(&decoded, stop_strings, finished);
+                Ok((visible.to_string(), matched))
+            }) {
+                Ok(result) => result,
+                Err(err) => {
+                    take_reply(&mut seq.reply).fail(err);
+                    return StepOutcome::Remove;
+                }
             }
         };
-        // Stops terminate on the current decoded prefix, even if streaming is
-        // buffered. Once matched, no future token can revise that prefix.
-        let (visible, matched) =
-            filter_stop_text(&decoded, &seq.stop_strings, seq.session.finished);
         if matched {
             seq.stopped_text = Some(visible.to_string());
+            // Capture the generated-token count at match time (including the
+            // stop tail, the llama.cpp/OpenAI convention): deriving it later
+            // from decoded-text lengths required a full re-decode per token.
+            seq.stopped_tokens = Some(seq.session.output.len() - seq.session.prompt_len);
             seq.session.finished = true;
             seq.session.finish_reason = "stop";
         }
@@ -1212,31 +1256,27 @@ impl Worker {
         let model = self.snapshot.name.clone();
         let seq = &mut self.active[index];
         let session = &seq.session;
-        let completion = session.visible_output();
-        let completion_tokens = if let Some(text) = &seq.stopped_text {
-            if text.is_empty() {
-                0
-            } else {
-                (1..=completion.len())
-                    .find(|&n| {
-                        safe_text(&self.tokenizer, &completion[..n], false)
-                            .is_ok_and(|decoded| decoded.len() >= text.len())
-                    })
-                    .unwrap_or(completion.len())
-            }
+        let completion_tokens = if let Some(tokens) = seq.stopped_tokens {
+            // Captured at match time; includes the stop tail, matching the
+            // llama.cpp/OpenAI convention for `finish_reason: "stop"`.
+            tokens
         } else {
-            completion.len()
+            session.visible_output().len()
         };
+        let completion = session.visible_output();
         let prompt_tokens = session.prompt_len;
         let finish_reason = session.finish_reason.to_string();
         let text = if let Some(text) = &seq.stopped_text {
             text.clone()
         } else {
-            match safe_text(&self.tokenizer, completion, true) {
+            // Tokenizer work stays panic-guarded: a latent decode panic must
+            // fail this request, not kill the worker for the whole process.
+            // Tokenizer work stays panic-guarded: a latent decode panic must
+            // fail this request, not kill the worker for the whole process.
+            match tokenizer_guard(|| safe_text(&self.tokenizer, completion, true)) {
                 Ok(text) => text,
                 Err(err) => {
-                    take_reply(&mut seq.reply)
-                        .fail(RuntimeError::new(RuntimeErrorKind::Internal, err));
+                    take_reply(&mut seq.reply).fail(err);
                     return;
                 }
             }
@@ -1310,6 +1350,28 @@ fn flatten_panic<T>(result: std::thread::Result<Result<T, String>>) -> Result<T,
     }
 }
 
+/// Run tokenizer-bound work under a panic guard: a latent decode panic must
+/// fail the single request with an Internal error instead of killing the
+/// worker thread, which has no respawn path — after an unguarded panic every
+/// later request would 503 until process restart.
+fn tokenizer_guard<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, RuntimeError> {
+    match catch_unwind(AssertUnwindSafe(work)) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(RuntimeError::new(RuntimeErrorKind::Internal, err)),
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            Err(RuntimeError::new(
+                RuntimeErrorKind::Internal,
+                format!("Tokenizer error: {message}"),
+            ))
+        }
+    }
+}
+
 /// Decode `tokens`; while a sequence is still running, drop a trailing
 /// replacement character produced by an incomplete multi-byte UTF-8 sequence
 /// so it is never streamed as garbage.
@@ -1343,6 +1405,30 @@ fn take_delta(sent: &mut String, text: String) -> Result<Option<String>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokenizer_guard_turns_panics_into_single_request_errors() {
+        // A latent tokenizer panic must surface as an Internal error for the
+        // failing request, never as a dead worker (which has no respawn path
+        // and would 503 every later request until process restart).
+        assert_eq!(tokenizer_guard(|| Ok(7)).unwrap(), 7);
+        let err = tokenizer_guard::<usize>(|| Err("decode failed".into())).unwrap_err();
+        assert_eq!(
+            err.status_code(),
+            crate::server::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(err.message, "decode failed");
+        let panic = tokenizer_guard::<()>(|| panic!("boom")).unwrap_err();
+        assert_eq!(
+            panic.status_code(),
+            crate::server::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(
+            panic.message.contains("Tokenizer error") && panic.message.contains("boom"),
+            "message: {}",
+            panic.message
+        );
+    }
 
     #[test]
     fn take_delta_is_prefix_safe() {

@@ -22,6 +22,9 @@ class ServerController(QObject):
     stopped = Signal()
     MAX_LOG_LINES = 600
     MAX_LINE_CHARS = 1200
+    HEALTH_GRACE_FAILURES = 3
+    MODEL_ACTION_TIMEOUT_MS = 120000
+    MODEL_LOAD_TIMEOUT_MS = 900000
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -39,6 +42,7 @@ class ServerController(QObject):
         self.starting = False
         self.stopping = False
         self.probing = False
+        self._health_failures = 0
         self._restart: Settings | None = None
         self._settings: Settings | None = None
         self._secret_history: deque[str] = deque(maxlen=8)
@@ -196,6 +200,7 @@ class ServerController(QObject):
             self.detail += " Check the server log for details."
             self.error.emit(self.detail)
         self.health, self.models, self.metrics, self.model_info = {}, [], {}, {}
+        self._health_failures = 0
         self.log(self.detail)
         restart, self._restart = self._restart, None
         self.changed.emit()
@@ -260,6 +265,7 @@ class ServerController(QObject):
         self.api.key = ""
         self.timer.stop()
         self.health, self.models, self.metrics, self.model_info = {}, [], {}, {}
+        self._health_failures = 0
         self.mode, self.state = "disconnected", "Disconnected"
         self.detail = "Start a server or connect to a local server."
         self.busy = False
@@ -274,6 +280,7 @@ class ServerController(QObject):
 
     def _health(self, status, data, error, _network):
         if status == 200 and isinstance(data, dict) and isinstance(data.get("model_loaded"), bool):
+            self._health_failures = 0
             self.starting = False
             self.health = data
             if not isinstance(self.health.get("model"), str):
@@ -286,7 +293,14 @@ class ServerController(QObject):
             if not self.authorized:
                 self.state = "API key required"
                 self.detail = "The server is reachable. Enter a valid key to access the protected API."
-        elif not self.starting:
+        elif self.starting:
+            pass  # Startup polls are not a connection verdict yet.
+        else:
+            # One unreachable poll is transient: keep the last successful health
+            # for a short grace period instead of wiping dependent UI state.
+            self._health_failures += 1
+            if self._health_failures < self.HEALTH_GRACE_FAILURES:
+                return
             self.health = {}
             self.state = "No connection"
             self.detail = "Cannot reach the local server. Check the address and port."
@@ -335,4 +349,6 @@ class ServerController(QObject):
                 self._fail(message or error or f"Model operation failed (HTTP {status}).")
             self.changed.emit()
             self.poll()
-        self.api.request("action", "/v1/model/" + action, finished, payload, timeout=120000)
+        # Loading multi-GB weights is slow; reload/unload stay on the short deadline.
+        timeout = self.MODEL_LOAD_TIMEOUT_MS if action == "load" else self.MODEL_ACTION_TIMEOUT_MS
+        self.api.request("action", "/v1/model/" + action, finished, payload, timeout=timeout)

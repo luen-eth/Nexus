@@ -7,12 +7,13 @@ import json
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from PySide6.QtCore import QEvent, QTimer, Qt
-from PySide6.QtNetwork import QNetworkProxy
+from PySide6.QtNetwork import QNetworkProxy, QNetworkReply
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
-from nexus_desktop.chat import ChatPanel
+from nexus_desktop.chat import ChatPanel, ChatTransport
 from nexus_desktop.controller import ServerController
 
 APP = QApplication.instance() or QApplication(["nexus-chat-tests"])
@@ -31,6 +32,11 @@ def wait(predicate, seconds=4):
 
 def event(value):
     return ("data: " + json.dumps(value, ensure_ascii=False) + "\r\n\r\n").encode()
+
+
+def lf(value):
+    """Same framing with bare LF terminators; the final blank line is added by callers."""
+    return ("data: " + json.dumps(value, ensure_ascii=False) + "\n\n").encode()
 
 
 def delta(text):
@@ -73,6 +79,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 self.server.release.wait(1.5)
                 self.wfile.write(delta(" stale tail") + final(99))
+            elif scenario == "drip":
+                for step in range(8):
+                    self.wfile.write(delta(f"piece{step} "))
+                    self.wfile.flush()
+                    time.sleep(.25)
+                self.wfile.write(final(5))
+            elif scenario == "lf":
+                item = {"choices": [{"delta": {}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13}}
+                # The last event ends with a single LF and no blank line, and no [DONE] follows.
+                self.wfile.write(lf({"choices": [{"delta": {"content": "Last "}, "finish_reason": None}]})
+                                 + lf({"choices": [{"delta": {"content": "event"}, "finish_reason": None}]})
+                                 + ("data: " + json.dumps(item) + "\n").encode())
+            elif scenario == "no-done":
+                item = {"choices": [{"delta": {}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 9, "completion_tokens": 6, "total_tokens": 15}}
+                self.wfile.write(delta("Unmarked ") + event(item))
+            elif scenario == "silent":
+                self.server.release.wait(2.5)
             elif scenario == "large":
                 self.wfile.write(delta("x" * 8192) + final())
             elif scenario == "invalid":
@@ -201,18 +226,74 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(self.panel.messages, [])
         self.assertIsNone(self.panel.last_stats)
 
-    def test_model_operation_clears_history_before_the_new_epoch_poll_arrives(self):
+    def test_failed_model_operation_preserves_history_and_a_new_epoch_clears_it(self):
         self.send()
         self.assertTrue(self.panel._history)
-        self.controller.busy = True
+        self.controller.busy = True  # A failed load toggles busy without changing the model epoch.
+        self.controller.changed.emit()
+        self.assertTrue(self.panel._history)
+        self.assertEqual(len(self.panel.messages), 2)
+        self.controller.busy = False
+        self.controller.changed.emit()
+        self.assertTrue(self.panel._history)
+        self.controller.model_info["epoch"] = 2  # A successful load reports a new epoch.
         self.controller.changed.emit()
         self.assertEqual(self.panel._history, [])
         self.assertEqual(self.panel.messages, [])
-        self.controller.busy = False
-        self.controller.changed.emit()
         self.send("Fresh model conversation")
         self.assertEqual(self.server.requests[-1][0]["messages"],
                          [{"role": "user", "content": "Fresh model conversation"}])
+
+    def test_transient_health_failures_keep_generation_and_three_consecutive_clear(self):
+        self.server.scenarios.append("slow")
+        self.panel.composer.setPlainText("In flight")
+        self.panel.send()
+        self.assertTrue(wait(lambda: self.panel.messages[-1]["content"] == "Partial"))
+        failure = (0, {}, "unreachable", QNetworkReply.NetworkError.ConnectionRefusedError)
+        for _ in range(2):
+            self.controller._health(*failure)
+            self.controller.changed.emit()  # Other polls keep refreshing the UI meanwhile.
+            self.assertTrue(self.panel.is_generating)
+            self.assertEqual([m["content"] for m in self.panel.messages], ["In flight", "Partial"])
+            self.assertTrue(self.controller.health.get("model_loaded"))
+        self.controller._health(*failure)  # The third consecutive failure clears the kept health.
+        self.assertEqual(self.controller.health, {})
+        self.controller.changed.emit()
+        self.assertTrue(self.panel.is_generating)  # A poll-driven refresh never cancels the stream.
+        self.server.release.set()
+        self.assertTrue(wait(lambda: not self.panel.is_generating))
+        self.assertEqual(self.panel.last_stats["status"], "complete")
+        self.assertEqual(self.panel._history[-1]["content"], "Partial stale tail")
+
+    def test_constant_activity_renews_the_idle_deadline_but_silence_still_aborts(self):
+        with patch.object(ChatTransport, "IDLE_TIMEOUT_MS", 1000), \
+                patch.object(ChatTransport, "ABSOLUTE_TIMEOUT_MS", 6000):
+            self.server.scenarios.append("drip")
+            self.panel.composer.setPlainText("Slow and steady")
+            self.panel.send()
+            self.assertTrue(wait(lambda: not self.panel.is_generating, seconds=10))
+            self.assertEqual(self.panel.last_stats["status"], "complete")
+            self.assertGreater(self.panel.last_stats["elapsed_seconds"], 1.2)
+            self.assertEqual(self.panel._history[-1]["role"], "assistant")
+            self.assertIn("piece7", self.panel._history[-1]["content"])
+            self.server.scenarios.append("silent")
+            self.panel.composer.setPlainText("Say nothing")
+            self.panel.send()
+            self.assertTrue(wait(lambda: not self.panel.is_generating, seconds=6))
+            self.assertEqual(self.panel.last_stats["status"], "error")
+            self.assertIn("timed out", self.panel.notice.text())
+            self.assertNotIn("Say nothing", [m["content"] for m in self.panel._history])
+
+    def test_missing_final_blank_line_and_missing_done_marker_still_commit(self):
+        for scenario, tokens, reply in (("lf", 4, "Last event"), ("no-done", 6, "Unmarked ")):
+            with self.subTest(scenario=scenario):
+                self.server.scenarios.append(scenario)
+                self.send("Finish anyway")
+                self.assertEqual(self.panel.last_stats["status"], "complete")
+                self.assertEqual(self.panel.last_stats["completion_tokens"], tokens)
+                self.assertEqual(self.panel.last_stats["finish_reason"], "stop")
+                self.assertEqual(self.panel._history[-1]["role"], "assistant")
+                self.assertEqual(self.panel._history[-1]["content"], reply)
 
     def test_auth_context_and_invalid_stream_errors_do_not_commit_history(self):
         for scenario, expected in [("auth", "API key"), ("error", "context window"),

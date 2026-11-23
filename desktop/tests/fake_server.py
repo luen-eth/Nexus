@@ -4,6 +4,7 @@ import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import time
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--port", type=int, required=True)
@@ -12,6 +13,12 @@ parser.add_argument("--model", default="")
 args, _ = parser.parse_known_args()
 key = os.environ.get("NEXUS_API_KEY", "")
 state = {"loaded": bool(args.model), "path": args.model}
+delays = {}
+for action in ("load", "reload", "unload"):
+    try:
+        delays[action] = float(os.environ.get("NEXUS_FAKE_DELAY_" + action.upper(), "") or 0)
+    except ValueError:
+        delays[action] = 0.0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -50,11 +57,14 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
-        if self.path.endswith("/load"):
+        action = self.path.rsplit("/", 1)[-1]
+        if delays.get(action):
+            time.sleep(delays[action])
+        if action == "load":
             state.update(loaded=True, path=data["model"])
-        elif self.path.endswith("/reload"):
+        elif action == "reload":
             state["loaded"] = bool(state["path"])
-        elif self.path.endswith("/unload"):
+        elif action == "unload":
             state["loaded"] = False
         else:
             self.response(404, {})

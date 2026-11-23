@@ -649,6 +649,54 @@ async fn a_whitespace_api_key_is_never_a_livable_secret() {
 }
 
 #[tokio::test]
+async fn requests_during_a_model_swap_fail_fast_instead_of_hanging() {
+    // Measured before the fix: a request addressed during a pending swap
+    // hung silently behind the drain of active sequences (12+ s in the
+    // smoke audit) with no status, no Retry-After and no deadline.
+    let server = TestServer::new("audit-A", false, options()).await;
+    let runtime = server.state.runtime.clone();
+    let held = runtime.submit_stream(request("held", 400)).unwrap();
+    until(|| held.len() >= 3).await;
+    let replacement = engine("audit-B", false);
+    let swap_runtime = Arc::clone(&runtime);
+    let install =
+        tokio::spawn(async move { swap_runtime.install(replacement, None).await.unwrap() });
+    until(|| runtime.stats().model_swap_pending).await;
+
+    let started = Instant::now();
+    let response = server
+        .post(
+            "/v1/completions",
+            json!({"model":"audit-A","prompt":"x","max_tokens":2}),
+        )
+        .await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.headers()[reqwest::header::RETRY_AFTER], "1");
+    let message = body(response).await["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("swap"), "message: {message}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the swap window must reject immediately, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(runtime.stats().queued, 0);
+
+    drop(held);
+    install.await.unwrap();
+    // After the swap completes the new model serves normally.
+    let response = server
+        .post(
+            "/v1/completions",
+            json!({"model":"audit-B","prompt":"x","max_tokens":2}),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
 async fn oversized_stop_payloads_are_rejected_before_reaching_the_worker() {
     let server = TestServer::new("audit-A", false, options()).await;
     let seventeen_stops: Vec<&str> = vec!["a"; 17];

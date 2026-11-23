@@ -195,6 +195,32 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(len(controller.logs), controller.MAX_LOG_LINES)
         self.assertLess(max(map(len, controller.logs)), 1250)
 
+    def test_model_load_waits_longer_than_the_short_reload_and_unload_deadline(self):
+        model = Path(self.directory.name) / "fixture.gguf"
+        model.write_bytes(b"fixture")
+        self.settings.model = str(model)
+        os.environ["NEXUS_FAKE_DELAY_LOAD"] = "1.2"
+        os.environ["NEXUS_FAKE_DELAY_RELOAD"] = "0.9"
+        try:
+            self.start()
+            with patch.object(ServerController, "MODEL_LOAD_TIMEOUT_MS", 2500), \
+                    patch.object(ServerController, "MODEL_ACTION_TIMEOUT_MS", 600):
+                self.controller.model_action("load", self.settings)
+                QTest.qWait(900)  # Beyond the short deadline; the pending load must not abort.
+                APP.processEvents()
+                self.assertTrue(self.controller.busy)
+                self.assertTrue(until(lambda: not self.controller.busy), self.controller.detail)
+                self.assertIn("Model loaded.", "\n".join(self.controller.logs))
+                self.controller.model_action("reload", self.settings)  # A slow reload still aborts.
+                self.assertTrue(until(lambda: not self.controller.busy))
+                self.assertTrue(any("timed out" in line for line in self.controller.logs))
+            self.controller.model_action("unload", self.settings)
+            self.assertTrue(until(lambda: not self.controller.busy))
+            self.assertIn("Model unloaded from memory.", "\n".join(self.controller.logs))
+        finally:
+            os.environ.pop("NEXUS_FAKE_DELAY_LOAD", None)
+            os.environ.pop("NEXUS_FAKE_DELAY_RELOAD", None)
+
     def test_window_close_waits_for_its_process_and_remains_responsive(self):
         window = MainWindow(self.settings, self.controller)
         self.windows.append(window)

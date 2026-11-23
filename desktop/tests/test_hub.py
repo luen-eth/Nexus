@@ -216,6 +216,37 @@ class HubTests(unittest.TestCase):
         self.assertTrue(wait(lambda:"local" not in panel._jobs))
         return panel
 
+    def test_construction_sweeps_only_stale_orphaned_part_files(self):
+        self.root.mkdir()
+        nested = self.root / "owner/repository"
+        nested.mkdir(parents=True)
+        old_download = nested / ".nexus-download-deadbeef.part"
+        fresh_download = nested / ".nexus-download-cafebabe.part"
+        old_download.write_bytes(b"orphan")
+        fresh_download.write_bytes(b"live")
+        published = self.root / "model.gguf"
+        published.write_bytes(gguf())
+        cache_dir = Path(self.temp.name) / "cache/nexus-desktop/logos"
+        cache_dir.mkdir(parents=True)
+        old_logo = cache_dir / ".logo-deadbeef.part"
+        fresh_logo = cache_dir / ".logo-cafebabe.part"
+        old_logo.write_bytes(b"orphan")
+        fresh_logo.write_bytes(b"live")
+        stale = time.time() - 25 * 3600
+        for path in (old_download, old_logo, published):
+            os.utime(path, (stale, stale))
+        with patch.dict(os.environ, {"XDG_CACHE_HOME": str(Path(self.temp.name) / "cache")}):
+            panel = ModelHubPanel(None, str(self.root))
+        self.panels.append(panel)
+        self.assertFalse(old_download.exists())
+        self.assertFalse(old_logo.exists())
+        self.assertTrue(fresh_download.exists())
+        self.assertTrue(fresh_logo.exists())
+        self.assertEqual(published.read_bytes(), gguf())  # Old published models are never touched.
+        self.assertIn("temporary", panel.status.text())
+        quiet = self.panel()  # Nothing left to sweep: the status line stays silent.
+        self.assertTrue(quiet.status.text().startswith("Public repositories only."))
+
     def test_panel_async_search_download_library_and_load_signal(self):
         panel = self.panel()
         self.assertEqual(self.server.requests, [])  # Startup never searches/downloads.

@@ -22,7 +22,8 @@ class ChatTransport(QObject):
     failed = Signal(str)
     MAX_RESPONSE_BYTES = 2 * 1024 * 1024
     MAX_EVENT_BYTES = 256 * 1024
-    TIMEOUT_MS = 180000
+    IDLE_TIMEOUT_MS = 60000
+    ABSOLUTE_TIMEOUT_MS = 30 * 60 * 1000
     READ_BYTES = 65536
 
     def __init__(self, parent=None):
@@ -43,7 +44,7 @@ class ChatTransport(QObject):
         request = QNetworkRequest(QUrl(local_url(base) + "/v1/chat/completions"))
         request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
                              QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
-        request.setTransferTimeout(30000)
+        request.setTransferTimeout(self.IDLE_TIMEOUT_MS)
         request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
         request.setRawHeader(b"Accept", b"text/event-stream")
         if key:
@@ -57,6 +58,8 @@ class ChatTransport(QObject):
                  "error": "", "draining": False, "finished": False}
         deadline = QTimer(reply)
         deadline.setSingleShot(True)
+        absolute = QTimer(reply)
+        absolute.setSingleShot(True)
 
         def active():
             return epoch == self._epoch and self.reply is reply
@@ -65,6 +68,12 @@ class ChatTransport(QObject):
             state["error"] = str(message)[:1000].replace(key, "[redacted]") if key else str(message)[:1000]
             if not state["finished"]:
                 reply.abort()
+
+        def arm_idle():
+            # The deadline is activity-based: any received byte proves the stream
+            # is alive, so a healthy slow reply never hits a wall clock.
+            if active():
+                deadline.start(self.IDLE_TIMEOUT_MS)
 
         def parse_event():
             data = b"\n".join(state["event"])
@@ -119,7 +128,10 @@ class ChatTransport(QObject):
             try:
                 while reply.bytesAvailable() and not state["error"] and active():
                     chunk = bytes(reply.read(self.READ_BYTES))
+                    if not chunk:
+                        break
                     state["bytes"] += len(chunk)
+                    arm_idle()
                     if state["bytes"] > self.MAX_RESPONSE_BYTES:
                         fail("The chat response exceeded the size limit.")
                         return
@@ -153,15 +165,29 @@ class ChatTransport(QObject):
             if active():
                 fail("The chat request timed out. Try a shorter prompt or output limit.")
 
+        def absolute_expired():
+            if active():
+                fail("The chat request exceeded the total time limit.")
+
         def finished():
             if state["finished"]:
                 return
             state["finished"] = True
             deadline.stop()
+            absolute.stop()
             if not active():
                 reply.deleteLater()
                 return
             drain()
+            # A stream may end without the final blank line; flush a pending
+            # data:-bearing event once so the last chunk and [DONE] are not dropped.
+            if not state["error"]:
+                tail = bytes(state["buffer"]).removesuffix(b"\r")
+                if tail.startswith(b"data:"):
+                    value = tail[5:]
+                    state["event"].append(value[1:] if value.startswith(b" ") else value)
+                if state["event"]:
+                    parse_event()
             code = int(reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute) or 0)
             network_error = reply.error()
             self.reply = None
@@ -194,7 +220,9 @@ class ChatTransport(QObject):
                 error = f"Chat request failed (HTTP {code})."
             if not error and network_error != QNetworkReply.NetworkError.NoError:
                 error = "The chat connection ended unexpectedly."
-            if not error and not state["done"]:
+            if not error and not state["done"] and state["reason"] is None:
+                # EOF without [DONE] but with a finish chunk is still a complete reply;
+                # a dangling content delta without a finish chunk stays an error.
                 error = "The chat stream ended before completion."
             # A delta observer may cancel or replace this request synchronously.
             if epoch != self._epoch:
@@ -208,7 +236,9 @@ class ChatTransport(QObject):
         reply.readyRead.connect(drain)
         reply.finished.connect(finished)
         deadline.timeout.connect(expired)
-        deadline.start(self.TIMEOUT_MS)
+        absolute.timeout.connect(absolute_expired)
+        deadline.start(self.IDLE_TIMEOUT_MS)
+        absolute.start(self.ABSOLUTE_TIMEOUT_MS)
 
 
 class Composer(QPlainTextEdit):
@@ -375,18 +405,16 @@ class ChatPanel(QWidget):
                 self.max_output.setMaximum(min(65536, context - 1))
             identity = (c.mode != "disconnected", c.api.base, c.api.key, c.api.epoch, selected,
                         info.get("epoch"), info.get("path"), info.get("backend"), context,
-                        bool(c.health.get("model_loaded")), c.authorized, c.busy)
+                        info.get("id"), c.authorized)
             if self._identity is not None and identity != self._identity:
                 had_messages = bool(self.messages)
                 self.new_chat()
                 if had_messages:
                     self.notice.setText("The connection or model changed. A new conversation is ready.")
             self._identity = identity
-            if c.busy and self.is_generating:
-                self.stop()
             if not self._ready():
-                if self.is_generating:
-                    self.stop()
+                # A poll-driven refresh never cancels an active stream: only a real
+                # disconnect (identity change above) or an explicit Stop may do that.
                 if not c.authorized:
                     self.notice.setText("Reconnect with a valid API key to chat.")
                 elif c.busy:
