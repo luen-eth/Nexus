@@ -1225,6 +1225,9 @@ impl Worker {
             // Capture the generated-token count at match time (including the
             // stop tail, the llama.cpp/OpenAI convention): deriving it later
             // from decoded-text lengths required a full re-decode per token.
+            // A stop matching in the budget-exhausting decode deliberately
+            // takes precedence over the engine's "length" verdict, matching
+            // llama.cpp.
             seq.stopped_tokens = Some(seq.session.output.len() - seq.session.prompt_len);
             seq.session.finished = true;
             seq.session.finish_reason = "stop";

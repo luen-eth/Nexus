@@ -197,7 +197,9 @@ When authentication is enabled, add `Authorization: Bearer <api-key>` or `x-api-
 
 Generation and device probing run outside Tokio's reactor threads. SSE suppresses partial stop strings and incomplete UTF-8, and disconnected clients are cleaned up. Decoders that can revise previous text buffer output until completion; this includes native Llama-3 BPE cleanup and complex HF decoder sequences. Unexpected revisions of already delivered text produce a stream error.
 
-Rate limits use the TCP peer address and ignore client-supplied forwarding headers. Behind a reverse proxy, clients share its bucket; configure client-level limits at the proxy.
+Usage accounting follows the llama.cpp/OpenAI convention: for `finish_reason: "stop"` from a stop string, `usage.completion_tokens` includes the withheld stop tail, captured when the match occurs. A stop string matching in the budget-exhausting decode takes precedence over `finish_reason: "length"`.
+
+Rate limits use the TCP peer address and ignore client-supplied forwarding headers. Behind a reverse proxy, clients share its bucket; configure client-level limits at the proxy. A limit of 0 disables per-peer limiting.
 
 ## Benchmarks
 

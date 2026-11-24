@@ -10,7 +10,7 @@ Connect to a server and load a model, then choose the model reported by that ser
 
 Every assistant reply has a compact statistics line: server-reported completion tokens, elapsed seconds, and tokens/s. Elapsed time covers the entire request, including network, queueing, prompt processing, and generation; tokens/s divides the reported completion count by that time. It is not a decoder-only benchmark. Interrupted replies and servers that omit usage show **Tokens unavailable**; the application never estimates counts from words, characters, or stream events.
 
-**Stop** cancels only the chat request and retains its partial text for inspection. Partial or failed replies are excluded from subsequent conversation history. **New chat** clears the conversation. History also resets when the connection, authentication, selected model, or model installation epoch changes, and when a load/reload/unload operation begins. Chat history is bounded and kept in memory; it is not written to settings or uploaded to Hugging Face. Messages are displayed as plain text, including model-generated links or HTML.
+**Stop** cancels only the chat request and retains its partial text for inspection. Partial or failed replies are excluded from subsequent conversation history. **New chat** clears the conversation. History also resets when the connection, authentication, selected model, or the loaded model's identity (installation epoch, path or context) changes; starting a load/reload/unload operation or a brief health-poll failure does not reset it by itself. Chat history is bounded and kept in memory; it is not written to settings or uploaded to Hugging Face. Messages are displayed as plain text, including model-generated links or HTML.
 
 ## Models and downloads
 

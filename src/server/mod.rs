@@ -1472,17 +1472,68 @@ pub async fn run_server_with_requested_config(
     println!();
 
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
-    let drain = serve_with_shutdown(listener, state, shutdown_signal());
-    match tokio::time::timeout(std::time::Duration::from_secs(25), drain).await {
-        Ok(result) => result?,
-        Err(_) => {
-            // In-flight streams that ignore the grace window (long SSE
-            // generations) are released here so shutdown stays bounded.
-            println!("Shutdown drain window elapsed; closing remaining connections.");
-        }
-    }
+    // The drain window must start when the shutdown SIGNAL resolves, never
+    // at startup: wrapping the whole serve future in a timeout capped the
+    // binary's uptime at the window length (the server self-terminated
+    // 25 s after start with exit 0 and no signal anywhere).
+    serve_with_bounded_drain(
+        listener,
+        state,
+        shutdown_signal(),
+        std::time::Duration::from_secs(25),
+    )
+    .await?;
 
     Ok(())
+}
+
+/// Serve until `signal` resolves, then bound only the post-signal drain by
+/// `window`. Before the signal the server runs without any time cap. After
+/// the window elapses the caller's process exit closes the remaining
+/// connections (detached tasks survive a dropped serve future; the message
+/// below says so honestly instead of implying an active close).
+async fn serve_with_bounded_drain(
+    listener: tokio::net::TcpListener,
+    state: ServerState,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+    window: std::time::Duration,
+) -> std::io::Result<()> {
+    let (fired_tx, mut fired_rx) = tokio::sync::watch::channel(());
+    let shutdown = async move {
+        signal.await;
+        let _ = fired_tx.send(());
+    };
+    let mut server = tokio::spawn(serve_with_shutdown(listener, state, shutdown));
+    // No cap before the signal: this arm waits for the server to end on
+    // its own (rare) while the watch stays silent.
+    tokio::select! {
+        result = &mut server => {
+            return join_serve(result);
+        }
+        _ = fired_rx.changed() => {}
+    }
+    bound_post_signal_drain(server, window).await
+}
+
+/// Wait for the (already signaled) serve task, bounded by `window`.
+async fn bound_post_signal_drain(
+    mut server: tokio::task::JoinHandle<std::io::Result<()>>,
+    window: std::time::Duration,
+) -> std::io::Result<()> {
+    match tokio::time::timeout(window, &mut server).await {
+        Ok(result) => join_serve(result),
+        Err(_) => {
+            println!("Shutdown drain window elapsed; process exit closes remaining connections.");
+            Ok(())
+        }
+    }
+}
+
+fn join_serve(result: Result<std::io::Result<()>, tokio::task::JoinError>) -> std::io::Result<()> {
+    match result {
+        Ok(result) => result,
+        Err(err) => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, err)),
+    }
 }
 
 #[cfg(test)]
@@ -1753,6 +1804,57 @@ mod tests {
             "serve must return after the shutdown signal"
         );
         assert!(outcome.unwrap().unwrap().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_drain_window_starts_at_the_signal_not_at_startup() {
+        // NEW-10 regression: the bounded-drain wrapper previously wrapped
+        // the WHOLE serve future in a timeout, so the binary self-terminated
+        // at the window length with exit 0 and no signal anywhere (verified
+        // empirically as a 25-second uptime cap on the wire).
+        let (_base, state) =
+            start(layered_fixture("uptime", 7), options(2, 8), open_config()).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut task = tokio::spawn(serve_with_bounded_drain(
+            listener,
+            state,
+            std::future::pending::<()>(),
+            Duration::from_millis(60),
+        ));
+        // Well past the 60 ms window: the server must still be serving.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let health = client()
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), 200, "the window must not cap uptime");
+        // And the serve future itself has not resolved.
+        if tokio::time::timeout(Duration::from_millis(50), &mut task)
+            .await
+            .is_ok()
+        {
+            panic!("serve resolved before any signal");
+        }
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_post_signal_drain_is_bounded_and_a_clean_drain_returns_promptly() {
+        // A serve task that ignores the shutdown (a stream held open past
+        // the grace) is released by the caller's process exit after the
+        // window — never before it, and not forever.
+        let never = tokio::spawn(async { std::future::pending::<std::io::Result<()>>().await });
+        let started = Instant::now();
+        let result = bound_post_signal_drain(never, Duration::from_millis(80)).await;
+        assert!(result.is_ok());
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // A serve task that completes drains immediately.
+        let done = tokio::spawn(async { Ok::<_, std::io::Error>(()) });
+        let result = bound_post_signal_drain(done, Duration::from_secs(30)).await;
+        assert!(result.is_ok());
     }
 
     fn client() -> reqwest::Client {

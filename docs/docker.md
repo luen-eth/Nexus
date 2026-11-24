@@ -26,7 +26,7 @@ docker --context default build --target prebuilt \
   -t nexus-server:0.2.0-cuda .
 ```
 
-The build checks the binary hash and executes `--help` inside Debian 13 to detect missing libraries or incompatible libc/libstdc++ versions. The hash check verifies the selected file, not its origin; use a binary you have built and validated. The runtime executes as UID/GID 10001 by default. Compose overrides that with your host IDs for model-file access. Tini forwards Docker's stop signal to the server; SIGTERM termination returns exit code 143 and does not promise draining in-flight requests.
+The build checks the binary hash and executes `--help` inside Debian 13 to detect missing libraries or incompatible libc/libstdc++ versions. The hash check verifies the selected file, not its origin; use a binary you have built and validated. The runtime executes as UID/GID 10001 by default. Compose overrides that with your host IDs for model-file access. Tini forwards Docker's stop signal to the server, which stops accepting new connections and drains in-flight requests within a bounded 25-second window measured from the signal; compose's `stop_grace_period: 30s` leaves headroom before SIGKILL. The process exits 0 after a completed (or window-elapsed) drain.
 
 ## GPU and model access
 
