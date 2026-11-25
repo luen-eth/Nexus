@@ -1147,7 +1147,10 @@ async fn reload_model(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let _lifecycle = state.runtime.lifecycle_guard().await;
     let current = state.runtime.snapshot();
-    let Some(path) = current.path.clone() else {
+    // Prefer the live path; after an unload the remembered last-installed
+    // path keeps reload usable (the previous behavior made reload answer
+    // "No previously loaded model path" forever after an unload).
+    let Some(path) = current.path.clone().or_else(|| current.last_path.clone()) else {
         return Err(ApiError::bad_request(
             "No previously loaded model path to reload",
         ));
@@ -1838,6 +1841,70 @@ mod tests {
             panic!("serve resolved before any signal");
         }
         task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn injected_tokenizer_panics_fail_one_request_and_leave_the_worker_alive() {
+        // F1 gate from the 136fab3 audit: the panic guards were only gated
+        // at helper level — removing the call-site guards passed the whole
+        // suite (mutation-verified). A real panicking tokenizer cannot be
+        // built from fixtures, so the guards are exercised through test
+        // injection points: the failing request must get an Internal
+        // "Tokenizer error" and the worker (which has no respawn path) must
+        // keep serving afterwards.
+        let scheduler = Arc::new(Scheduler::new(1));
+        let runtime = Arc::new(
+            Runtime::start(
+                scripted_fixture("panic", &cycle("a"), 64),
+                Some(PathBuf::from("/models/p.gguf")),
+                scheduler,
+                options(1, 4),
+            )
+            .unwrap(),
+        );
+
+        // prepare path: the request fails at admission, via its receiver.
+        runtime.inject_tokenizer_panic(true, false);
+        let err = runtime
+            .submit(text_request("panic-prepare", "a", 3))
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            err.message.contains("Tokenizer error") && err.message.contains("prepare"),
+            "message: {}",
+            err.message
+        );
+        wait_until("kv released", || runtime.scheduler().kv_page_stats().0 == 0).await;
+
+        // decode path: admission succeeds; the request dies mid-generation.
+        runtime.inject_tokenizer_panic(false, true);
+        let mut request = text_request("panic-decode", "a", 8);
+        request.stop = vec!["zz".to_string()];
+        let err = runtime.submit(request).unwrap().await.unwrap().unwrap_err();
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            err.message.contains("Tokenizer error") && err.message.contains("decode"),
+            "message: {}",
+            err.message
+        );
+        // The receiver learns of the failure before the worker finishes the
+        // Remove bookkeeping; wait for the counters instead of asserting.
+        wait_until("kv released", || runtime.scheduler().kv_page_stats().0 == 0).await;
+        wait_until("worker idle", || runtime.stats().active == 0).await;
+
+        // The worker survived both: a clean request completes normally.
+        runtime.inject_tokenizer_panic(false, false);
+        let output = runtime
+            .submit(text_request("after", "a", 3))
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.text, "aaa");
+        assert_eq!(output.finish_reason, "length");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3123,7 +3190,20 @@ mod tests {
         assert_eq!(info["loaded"], false);
         assert_eq!(info["path"], serde_json::Value::Null);
         assert_eq!(info["epoch"], body["epoch"]);
-        assert_eq!(post("/v1/model/reload", serde_json::json!({})).await.0, 400);
+        // Reload after unload uses the remembered last-installed path: it
+        // previously answered 400 forever, leaving the operator no way back
+        // to the working model without a full load request.
+        let (status, body) = post("/v1/model/reload", serde_json::json!({})).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["status"], "reloaded");
+        assert_eq!(body["loaded"], true);
+        assert_eq!(body["epoch"], epoch + 3);
+        assert_eq!(get("/health").await.1["status"], "ok");
+        let (_, restored) = post("/v1/completions", complete.clone()).await;
+        assert_eq!(
+            restored["choices"][0]["text"], first["choices"][0]["text"],
+            "the reloaded model must generate the original output"
+        );
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unauthorized_requests_consume_peer_rate_limit() {

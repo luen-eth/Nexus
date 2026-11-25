@@ -70,6 +70,18 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"error":{"message":"Prompt and output exceed the context window."}}')
             return
+        if scenario == "abort":
+            # Announce more bytes than will ever arrive: closing now is a
+            # transport error (RemoteHostClosed), not a clean EOF, so the
+            # truncated residual line must never be parsed as an event.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", "2048")
+            self.end_headers()
+            self.wfile.write(b"data: " + json.dumps(
+                {"choices": [{"delta": {"content": "half"}, "finish_reason": None}]})[:24].encode())
+            self.wfile.flush()
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -250,12 +262,25 @@ class ChatTests(unittest.TestCase):
         self.panel.send()
         self.assertTrue(wait(lambda: self.panel.messages[-1]["content"] == "Partial"))
         failure = (0, {}, "unreachable", QNetworkReply.NetworkError.ConnectionRefusedError)
+        success = (200, {"status": "ok", "model_loaded": True, "model": "fixture"}, "",
+                   QNetworkReply.NetworkError.NoError)
         for _ in range(2):
             self.controller._health(*failure)
             self.controller.changed.emit()  # Other polls keep refreshing the UI meanwhile.
             self.assertTrue(self.panel.is_generating)
             self.assertEqual([m["content"] for m in self.panel.messages], ["In flight", "Partial"])
             self.assertTrue(self.controller.health.get("model_loaded"))
+        # A single successful poll resets the grace counter: two more
+        # cumulative failures (with a success in between) are not three
+        # consecutive ones and must not wipe the kept health.
+        self.controller._health(*success)
+        self.assertEqual(self.controller.state, "Ready")
+        for _ in range(2):
+            self.controller._health(*failure)
+            self.controller.changed.emit()
+            self.assertTrue(self.panel.is_generating)
+            self.assertTrue(self.controller.health.get("model_loaded"))
+            self.assertNotEqual(self.controller.state, "No connection")
         self.controller._health(*failure)  # The third consecutive failure clears the kept health.
         self.assertEqual(self.controller.health, {})
         self.controller.changed.emit()
@@ -266,6 +291,9 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(self.panel._history[-1]["content"], "Partial stale tail")
 
     def test_constant_activity_renews_the_idle_deadline_but_silence_still_aborts(self):
+        # Qt's transfer timeout must strictly outlive the app idle deadline so
+        # the friendlier stall message always wins the race.
+        self.assertGreater(ChatTransport.TRANSFER_TIMEOUT_MS, ChatTransport.IDLE_TIMEOUT_MS)
         with patch.object(ChatTransport, "IDLE_TIMEOUT_MS", 1000), \
                 patch.object(ChatTransport, "ABSOLUTE_TIMEOUT_MS", 6000):
             self.server.scenarios.append("drip")
@@ -294,6 +322,14 @@ class ChatTests(unittest.TestCase):
                 self.assertEqual(self.panel.last_stats["finish_reason"], "stop")
                 self.assertEqual(self.panel._history[-1]["role"], "assistant")
                 self.assertEqual(self.panel._history[-1]["content"], reply)
+
+    def test_transport_error_mid_event_is_not_relabelled_as_an_invalid_event(self):
+        self.server.scenarios.append("abort")
+        self.send("Cut me off")
+        self.assertEqual(self.panel.last_stats["status"], "error")
+        self.assertIn("ended unexpectedly", self.panel.notice.text())
+        self.assertNotIn("invalid chat event", self.panel.notice.text())
+        self.assertEqual(self.panel._history, [])
 
     def test_auth_context_and_invalid_stream_errors_do_not_commit_history(self):
         for scenario, expected in [("auth", "API key"), ("error", "context window"),

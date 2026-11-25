@@ -23,6 +23,10 @@ class ChatTransport(QObject):
     MAX_RESPONSE_BYTES = 2 * 1024 * 1024
     MAX_EVENT_BYTES = 256 * 1024
     IDLE_TIMEOUT_MS = 60000
+    # Qt's own transfer timeout must never fire before the app-level idle
+    # deadline: keep it strictly larger so a stall surfaces the friendlier
+    # "timed out" message instead of Qt's opaque operation-canceled error.
+    TRANSFER_TIMEOUT_MS = IDLE_TIMEOUT_MS + 5000
     ABSOLUTE_TIMEOUT_MS = 30 * 60 * 1000
     READ_BYTES = 65536
 
@@ -44,7 +48,7 @@ class ChatTransport(QObject):
         request = QNetworkRequest(QUrl(local_url(base) + "/v1/chat/completions"))
         request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
                              QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
-        request.setTransferTimeout(self.IDLE_TIMEOUT_MS)
+        request.setTransferTimeout(self.TRANSFER_TIMEOUT_MS)
         request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
         request.setRawHeader(b"Accept", b"text/event-stream")
         if key:
@@ -180,8 +184,11 @@ class ChatTransport(QObject):
                 return
             drain()
             # A stream may end without the final blank line; flush a pending
-            # data:-bearing event once so the last chunk and [DONE] are not dropped.
-            if not state["error"]:
+            # data:-bearing event once so the last chunk and [DONE] are not
+            # dropped. Only a clean EOF (NoError) may flush: a transport error
+            # mid-event means the tail is truncated, and parsing it would
+            # mislabel a network cut as "invalid chat event".
+            if not state["error"] and reply.error() == QNetworkReply.NetworkError.NoError:
                 tail = bytes(state["buffer"]).removesuffix(b"\r")
                 if tail.startswith(b"data:"):
                     value = tail[5:]

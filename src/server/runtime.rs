@@ -102,6 +102,9 @@ pub struct ModelSnapshot {
     pub loaded: bool,
     pub name: String,
     pub path: Option<PathBuf>,
+    /// Last successfully installed model path, preserved across unload so
+    /// `/v1/model/reload` still has a target after `/v1/model/unload`.
+    pub last_path: Option<PathBuf>,
     pub backend: BackendType,
     pub max_seq_len: usize,
     /// Body of `GET /v1/model` (without `id`/`path`).
@@ -115,9 +118,11 @@ pub struct ModelSnapshot {
 }
 
 impl ModelSnapshot {
+    #[allow(clippy::too_many_arguments)]
     fn from_engine(
         engine: &InferenceEngine,
         path: Option<PathBuf>,
+        last_path: Option<PathBuf>,
         epoch: u64,
         requested_config: crate::engine::InferenceConfig,
     ) -> Self {
@@ -183,6 +188,7 @@ impl ModelSnapshot {
             loaded,
             name,
             path,
+            last_path,
             backend: engine.backend.backend_type(),
             max_seq_len: config.max_seq_len,
             info,
@@ -452,6 +458,13 @@ struct Shared {
     gpu_kernel_launches: AtomicU64,
     backend_healthy: AtomicBool,
     active_kv_payload_bytes: AtomicUsize,
+    /// Test-only injection points for the tokenizer panic guards: a real
+    /// panicking tokenizer cannot be constructed from fixtures, so the
+    /// call-site guards are exercised by flipping these flags instead.
+    #[cfg(test)]
+    panic_in_prepare: AtomicBool,
+    #[cfg(test)]
+    panic_in_decode: AtomicBool,
 }
 
 impl Shared {
@@ -506,6 +519,7 @@ impl Runtime {
         let model_path = model_path.filter(|_| engine.model.is_some());
         let snapshot = Arc::new(ModelSnapshot::from_engine(
             &engine,
+            model_path.clone(),
             model_path,
             0,
             requested_config,
@@ -525,6 +539,10 @@ impl Runtime {
             gpu_kernel_launches: AtomicU64::new(0),
             backend_healthy: AtomicBool::new(engine.backend.is_available()),
             active_kv_payload_bytes: AtomicUsize::new(0),
+            #[cfg(test)]
+            panic_in_prepare: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_in_decode: AtomicBool::new(false),
         });
 
         let worker_shared = shared.clone();
@@ -582,6 +600,20 @@ impl Runtime {
             backend_healthy: self.shared.backend_healthy.load(Ordering::Relaxed),
             active_kv_payload_bytes: self.shared.active_kv_payload_bytes.load(Ordering::Relaxed),
         }
+    }
+
+    /// Test hook: inject a panic into the guarded tokenizer paths (a real
+    /// panicking tokenizer cannot be built from fixtures). Proves the
+    /// call-site guards fail the single request instead of killing the
+    /// worker thread.
+    #[cfg(test)]
+    pub fn inject_tokenizer_panic(&self, in_prepare: bool, in_decode: bool) {
+        self.shared
+            .panic_in_prepare
+            .store(in_prepare, Ordering::SeqCst);
+        self.shared
+            .panic_in_decode
+            .store(in_decode, Ordering::SeqCst);
     }
 
     /// Serialize model lifecycle operations (load/reload/unload). Hold the
@@ -884,6 +916,15 @@ impl Worker {
             reply,
         } = install;
         let path = path.filter(|_| engine.model.is_some());
+        // Remember the last successfully installed model path across unload:
+        // `/v1/model/reload` keeps working after `/v1/model/unload` instead
+        // of answering "No previously loaded model path" forever.
+        let last_path = path.clone().or_else(|| {
+            self.snapshot
+                .last_path
+                .clone()
+                .or(self.snapshot.path.clone())
+        });
         let old = std::mem::replace(&mut self.engine, *engine);
         drop(old);
         self.tokenizer = tokenizer_for(&self.engine);
@@ -894,6 +935,7 @@ impl Worker {
         let snapshot = Arc::new(ModelSnapshot::from_engine(
             &self.engine,
             path,
+            last_path,
             self.snapshot.epoch + 1,
             requested_config,
         ));
@@ -942,7 +984,13 @@ impl Worker {
         // chat-template rendering or encoding must fail this request, not
         // kill the worker for the whole process (the worker has no respawn
         // path, so an unguarded panic would 503 every later request).
-        let prepared = catch_unwind(AssertUnwindSafe(|| self.prepare(&request)));
+        let prepared = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if self.shared.panic_in_prepare.load(Ordering::SeqCst) {
+                panic!("injected tokenizer panic (prepare)");
+            }
+            self.prepare(&request)
+        }));
         let (prompt, generation) = match prepared {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(err)) => {
@@ -950,14 +998,9 @@ impl Worker {
                 return;
             }
             Err(panic) => {
-                let message = panic
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic".to_string());
                 reply.fail(RuntimeError::new(
                     RuntimeErrorKind::Internal,
-                    format!("Tokenizer error: {message}"),
+                    format!("Tokenizer error: {}", panic_to_string(panic)),
                 ));
                 return;
             }
@@ -1209,6 +1252,10 @@ impl Worker {
             let finished = seq.session.finished;
             let output = seq.session.visible_output();
             match tokenizer_guard(|| {
+                #[cfg(test)]
+                if self.shared.panic_in_decode.load(Ordering::SeqCst) {
+                    panic!("injected tokenizer panic (decode)");
+                }
                 let decoded = safe_text(&self.tokenizer, output, finished)?;
                 let (visible, matched) = filter_stop_text(&decoded, stop_strings, finished);
                 Ok((visible.to_string(), matched))
@@ -1272,8 +1319,6 @@ impl Worker {
         let text = if let Some(text) = &seq.stopped_text {
             text.clone()
         } else {
-            // Tokenizer work stays panic-guarded: a latent decode panic must
-            // fail this request, not kill the worker for the whole process.
             // Tokenizer work stays panic-guarded: a latent decode panic must
             // fail this request, not kill the worker for the whole process.
             match tokenizer_guard(|| safe_text(&self.tokenizer, completion, true)) {
@@ -1361,18 +1406,21 @@ fn tokenizer_guard<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, Run
     match catch_unwind(AssertUnwindSafe(work)) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(RuntimeError::new(RuntimeErrorKind::Internal, err)),
-        Err(panic) => {
-            let message = panic
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown panic".to_string());
-            Err(RuntimeError::new(
-                RuntimeErrorKind::Internal,
-                format!("Tokenizer error: {message}"),
-            ))
-        }
+        Err(panic) => Err(RuntimeError::new(
+            RuntimeErrorKind::Internal,
+            format!("Tokenizer error: {}", panic_to_string(panic)),
+        )),
     }
+}
+
+/// Flatten a caught panic payload into a human-readable message, shared by
+/// every guard site so the wording cannot drift between them.
+fn panic_to_string(panic: Box<dyn std::any::Any + Send>) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }
 
 /// Decode `tokens`; while a sequence is still running, drop a trailing

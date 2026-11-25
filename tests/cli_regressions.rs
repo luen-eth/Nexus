@@ -99,6 +99,56 @@ fn cli_returns_failure_when_inference_fails() {
 }
 
 #[test]
+fn run_without_a_prompt_fails_before_loading_the_model() {
+    // NEW-4 gate: a prompt-less run previously loaded the whole multi-GB
+    // model, printed a notice and exited 0. It must fail fast, after the
+    // argument validations but before any model file is touched.
+    let file = tempfile::NamedTempFile::new().unwrap();
+    common::TinyModel::new().write(file.path());
+    let output = Command::new(env!("CARGO_BIN_EXE_nexus"))
+        .args(["run", "--model"])
+        .arg(file.path())
+        .args(["--allow-byte-tokenizer"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no prompt provided"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The model was never loaded: no post-load engine banner was printed.
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Layers:"));
+}
+
+#[cfg(unix)]
+#[test]
+fn piped_cli_output_never_panics_on_epipe() {
+    // NEW-5 gate: `nexus info --model X | head` previously panicked with
+    // "failed printing to stdout: Broken pipe" and exited 101. With the
+    // restored SIGPIPE default the CLI either finishes before the reader
+    // closes (0) or ends with the conventional SIGPIPE (141) — never a
+    // Rust panic.
+    use std::os::unix::process::ExitStatusExt;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    common::TinyModel::new().write(file.path());
+    let script = format!(
+        "{:?} info --model {:?} | head -1",
+        env!("CARGO_BIN_EXE_nexus"),
+        file.path()
+    );
+    let output = Command::new("sh").arg("-c").arg(script).output().unwrap();
+    let code = output.status.code().unwrap_or(-1);
+    let signal = output.status.signal();
+    assert!(
+        code == 0 || signal == Some(13),
+        "unexpected exit: code={code:?} signal={signal:?}, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(code, 101, "the CLI must not panic on EPIPE");
+}
+
+#[test]
 fn cli_rejects_unavailable_and_unknown_backends() {
     for backend in ["metal", "vulkan", "webgpu", "typo"] {
         let output = Command::new(env!("CARGO_BIN_EXE_nexus"))
@@ -354,6 +404,9 @@ fn explicit_cpu_thread_limit_is_applied_to_benchmark_and_run() {
     let output = Command::new(env!("CARGO_BIN_EXE_nexus"))
         .args(["run", "--model"])
         .arg(file.path())
+        // A prompt is required before the model is loaded now; the fixture's
+        // byte vocabulary only admits control-byte tokens.
+        .args(["--prompt", "\u{1}\u{2}", "--max-tokens", "1"])
         .args(["--threads", "1", "--allow-byte-tokenizer"])
         .output()
         .unwrap();

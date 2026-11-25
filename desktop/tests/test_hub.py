@@ -226,6 +226,19 @@ class HubTests(unittest.TestCase):
         fresh_download.write_bytes(b"live")
         published = self.root / "model.gguf"
         published.write_bytes(gguf())
+        # Symlink decoys: a symlinked directory that looks like a part-file
+        # holder, and a symlink dressed up as a part file, must both stay
+        # untouched — never followed into, never deleted.
+        outside = Path(self.temp.name) / "outside"
+        outside.mkdir()
+        decoy_download = outside / ".nexus-download-0badfeed.part"
+        decoy_download.write_bytes(b"decoy")
+        linked_holder = self.root / "linked"
+        linked_holder.symlink_to(outside, target_is_directory=True)
+        decoy_target = Path(self.temp.name) / "target.bin"
+        decoy_target.write_bytes(b"keep")
+        linked_part = self.root / ".nexus-download-feedface.part"
+        linked_part.symlink_to(decoy_target)
         cache_dir = Path(self.temp.name) / "cache/nexus-desktop/logos"
         cache_dir.mkdir(parents=True)
         old_logo = cache_dir / ".logo-deadbeef.part"
@@ -233,7 +246,7 @@ class HubTests(unittest.TestCase):
         old_logo.write_bytes(b"orphan")
         fresh_logo.write_bytes(b"live")
         stale = time.time() - 25 * 3600
-        for path in (old_download, old_logo, published):
+        for path in (old_download, old_logo, published, decoy_download):
             os.utime(path, (stale, stale))
         with patch.dict(os.environ, {"XDG_CACHE_HOME": str(Path(self.temp.name) / "cache")}):
             panel = ModelHubPanel(None, str(self.root))
@@ -242,10 +255,36 @@ class HubTests(unittest.TestCase):
         self.assertFalse(old_logo.exists())
         self.assertTrue(fresh_download.exists())
         self.assertTrue(fresh_logo.exists())
+        self.assertTrue(decoy_download.exists())  # The sweep never follows the linked directory.
+        self.assertTrue(linked_holder.is_symlink())
+        self.assertTrue(linked_part.is_symlink())  # A part-named symlink is never deleted.
+        self.assertTrue(decoy_target.exists())
         self.assertEqual(published.read_bytes(), gguf())  # Old published models are never touched.
         self.assertIn("temporary", panel.status.text())
         quiet = self.panel()  # Nothing left to sweep: the status line stays silent.
         self.assertTrue(quiet.status.text().startswith("Public repositories only."))
+        self.assertTrue(decoy_download.exists())  # A second sweep still refuses the decoys.
+        self.assertTrue(linked_part.is_symlink())
+
+    def test_a_large_models_tree_never_starves_the_logo_sweep_budget(self):
+        # Over 5000 models-root entries exhaust that walk's entry budget; the
+        # logo-cache sweep must still receive its own fresh budget.
+        self.root.mkdir()
+        filler = self.root / "filler"
+        filler.mkdir()
+        for index in range(5001):
+            (filler / f"padding-{index:05}").write_bytes(b"")
+        cache_dir = Path(self.temp.name) / "cache/nexus-desktop/logos"
+        cache_dir.mkdir(parents=True)
+        old_logo = cache_dir / ".logo-deadbeef.part"
+        old_logo.write_bytes(b"orphan")
+        stale = time.time() - 25 * 3600
+        os.utime(old_logo, (stale, stale))
+        with patch.dict(os.environ, {"XDG_CACHE_HOME": str(Path(self.temp.name) / "cache")}):
+            panel = ModelHubPanel(None, str(self.root))
+        self.panels.append(panel)
+        self.assertFalse(old_logo.exists())
+        self.assertIn("abandoned temporary file", panel.status.text())
 
     def test_panel_async_search_download_library_and_load_signal(self):
         panel = self.panel()

@@ -489,32 +489,37 @@ def sweep_orphaned_parts(models_root: Path, logo_dir: Path) -> int:
     cutoff = time.time() - 24 * 60 * 60
     removed = 0
 
-    def sweep(folder, prefix, depth=0, budget=[5000]):
+    def sweep(folder, prefix, depth=0, budget=None):
         nonlocal removed
+        if budget is None:
+            # Each top-level sweep gets a fresh budget: a huge models tree must
+            # never starve the logo-cache sweep of its own entry allowance.
+            budget = [5000]
         folder = Path(folder)
         if budget[0] <= 0 or folder.is_symlink() or not folder.is_dir():
             return
         try:
             with os.scandir(folder) as scan:
-                entries = list(scan)
+                # Iterate lazily: a huge flat directory is never materialized
+                # in memory and the per-entry budget stops the walk early.
+                for entry in scan:
+                    if budget[0] <= 0:
+                        break
+                    budget[0] -= 1
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False) and depth < 20:
+                            sweep(Path(entry.path), prefix, depth + 1, budget)
+                        elif (entry.is_file(follow_symlinks=False)
+                                and entry.name.startswith(prefix) and entry.name.endswith(".part")
+                                and entry.stat(follow_symlinks=False).st_mtime < cutoff):
+                            os.unlink(entry.path)
+                            removed += 1
+                    except OSError:
+                        continue
         except OSError:
             return
-        for entry in entries:
-            if budget[0] <= 0:
-                break
-            budget[0] -= 1
-            try:
-                if entry.is_symlink():
-                    continue
-                if entry.is_dir(follow_symlinks=False) and depth < 20:
-                    sweep(Path(entry.path), prefix, depth + 1)
-                elif (entry.is_file(follow_symlinks=False)
-                        and entry.name.startswith(prefix) and entry.name.endswith(".part")
-                        and entry.stat(follow_symlinks=False).st_mtime < cutoff):
-                    os.unlink(entry.path)
-                    removed += 1
-            except OSError:
-                continue
 
     sweep(models_root, ".nexus-download-")
     sweep(logo_dir, ".logo-")

@@ -201,6 +201,15 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Restore the Unix pipe convention for the CLI: `nexus info | head`
+    // should end quietly at the reader's close instead of panicking on
+    // EPIPE with exit code 101. The server keeps SIGPIPE ignored on
+    // purpose (a closed docker log stream must not kill it).
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -401,6 +410,13 @@ async fn run_inference(
     println!("Weight Quant: {}", weight_format.name());
     println!();
 
+    // Reject a prompt-less run before touching the model: loading a multi-GB
+    // GGUF only to report a missing prompt wasted minutes and RAM. The
+    // argument validations above stay ahead of this check on purpose.
+    let Some(prompt) = prompt else {
+        anyhow::bail!("no prompt provided: use -p 'text' (or --stop for stop sequences)");
+    };
+
     // Load model
     match engine.load_model(&model_path) {
         Ok(()) => {}
@@ -432,37 +448,31 @@ async fn run_inference(
     }
 
     // Run inference
-    if let Some(prompt_text) = prompt {
-        println!("Prompt: {}", prompt_text);
-        println!("---");
+    println!("Prompt: {}", prompt);
+    println!("---");
 
-        let tokenizer = engine
-            .tokenizer
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Tokenizer not loaded"))?;
-        generation.stop_sequences.clear();
-        let tokens = tokenizer
-            .try_encode(&prompt_text)
+    let tokenizer = engine
+        .tokenizer
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Tokenizer not loaded"))?;
+    generation.stop_sequences.clear();
+    let tokens = tokenizer.try_encode(&prompt).map_err(anyhow::Error::msg)?;
+    let mut session = engine
+        .start_session(&tokens, &generation)
+        .map_err(anyhow::Error::msg)?;
+    while !session.finished {
+        engine
+            .step_session(&mut session)
             .map_err(anyhow::Error::msg)?;
-        let mut session = engine
-            .start_session(&tokens, &generation)
+        let decoded = tokenizer
+            .try_decode(session.visible_output())
             .map_err(anyhow::Error::msg)?;
-        while !session.finished {
-            engine
-                .step_session(&mut session)
-                .map_err(anyhow::Error::msg)?;
-            let decoded = tokenizer
-                .try_decode(session.visible_output())
-                .map_err(anyhow::Error::msg)?;
-            let (visible, matched) =
-                nexus::tokenizer::filter_stop_text(&decoded, &stop, session.finished);
-            if matched || session.finished {
-                println!("{}", visible);
-                break;
-            }
+        let (visible, matched) =
+            nexus::tokenizer::filter_stop_text(&decoded, &stop, session.finished);
+        if matched || session.finished {
+            println!("{}", visible);
+            break;
         }
-    } else {
-        println!("No prompt provided. Use -p 'text' to generate text.");
     }
 
     // Print memory report

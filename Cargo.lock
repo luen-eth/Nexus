@@ -1521,6 +1521,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "half",
+ "libc",
  "llama-cpp-2",
  "memmap2",
  "metal",
