@@ -412,7 +412,7 @@ class ChatPanel(QWidget):
                 self.max_output.setMaximum(min(65536, context - 1))
             identity = (c.mode != "disconnected", c.api.base, c.api.key, c.api.epoch, selected,
                         info.get("epoch"), info.get("path"), info.get("backend"), context,
-                        info.get("id"), c.authorized)
+                        info.get("id"), c.authorized, c.health.get("boot_id"))
             if self._identity is not None and identity != self._identity:
                 had_messages = bool(self.messages)
                 self.new_chat()

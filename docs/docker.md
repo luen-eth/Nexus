@@ -48,7 +48,7 @@ curl --fail http://127.0.0.1:8080/health
 
 Keep the same API key when recreating the container and connecting the GUI. The health endpoint is public; management, metrics and inference requests need the key. Do not commit keys or machine-specific paths to the repository. The Compose readiness check requires a loaded model; unloading it intentionally changes readiness to unhealthy until another model is loaded.
 
-The server listens on `0.0.0.0:8080` **inside** the container; Docker publishes it only on host `127.0.0.1`. The model directory is read-only, the container root filesystem is read-only, and no Docker socket or privileged mode is needed. `NEXUS_PORT`, `NEXUS_CTX_SIZE`, `NEXUS_KV_QUANT` and `NEXUS_BATCH_SIZE` can override the Compose defaults. Allow enough memory for context caches and temporary old/new weights during model replacement.
+The server listens on `0.0.0.0:8080` **inside** the container; Docker publishes it only on host `127.0.0.1`. The model directory is read-only, the container root filesystem is read-only, and no Docker socket or privileged mode is needed. `NEXUS_PORT`, `NEXUS_CTX_SIZE`, `NEXUS_KV_QUANT`, `NEXUS_BATCH_SIZE` and `NEXUS_RATE_LIMIT_PER_MINUTE` (set to 0 to rely on a fronting proxy's own limit) can override the Compose defaults. Allow enough memory for context caches and temporary old/new weights during model replacement.
 
 If your Docker installation uses the registered legacy NVIDIA runtime instead of CDI, run the image directly using `--gpus all`, as described in [NVIDIA's Docker configuration](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html). Preserve the loopback publication, read-only model bind and explicit `--backend cuda`; `auto` selects CPU.
 

@@ -171,6 +171,12 @@ pub struct ServerConfig {
     /// address; `X-Forwarded-For` and similar headers are ignored because
     /// clients can forge them.
     pub rate_limit_per_minute: Option<usize>,
+    /// Optional root directory that `/v1/model/load` (and reload) paths must
+    /// resolve into. `None` keeps the loopback single-tenant default where
+    /// any accessible regular file may be loaded; set by `nexus-server
+    /// --models-root` (canonicalized once at startup). Closes the arbitrary
+    /// path oracle and the GGUF metadata disclosure of S-2/NS-6.
+    pub models_root: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -185,11 +191,16 @@ impl ServerConfig {
         let rate_limit_per_minute = std::env::var("NEXUS_RATE_LIMIT_PER_MINUTE")
             .ok()
             .and_then(|value| value.parse().ok());
+        let models_root = std::env::var("NEXUS_MODELS_ROOT")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
 
         ServerConfig {
             api_key,
             cors_origin,
             rate_limit_per_minute,
+            models_root,
         }
     }
 }
@@ -215,6 +226,11 @@ pub struct ModelLoadRequest {
 pub struct ServerState {
     pub runtime: Arc<Runtime>,
     pub server_config: Arc<ServerConfig>,
+    /// Process-unique boot identifier (UNIX_EPOCH milliseconds at
+    /// construction). Survives every model install, so a client can tell a
+    /// full server restart from an epoch bump within one process; the epoch
+    /// alone aliases across restarts (T-F2).
+    pub boot_id: u64,
     rate_limiter: Arc<RateLimiter>,
     model_loader: Arc<ModelLoader>,
 }
@@ -258,6 +274,10 @@ impl ServerState {
             options,
             requested_config,
         )?;
+        let boot_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_micros() as u64)
+            .unwrap_or(0);
         Ok(ServerState {
             runtime: Arc::new(runtime),
             model_loader,
@@ -266,6 +286,7 @@ impl ServerState {
                 Duration::from_secs(60),
             )),
             server_config: Arc::new(server_config),
+            boot_id,
         })
     }
 
@@ -1125,6 +1146,34 @@ fn ensure_regular_model_file(path: &std::path::Path) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// S-2/NS-6: with a models root configured, a request path must canonically
+/// resolve inside that root before it reaches the loader. Canonicalization
+/// resolves symlinks, so a link stored inside the root but pointing elsewhere
+/// is rejected too. The failure message is deliberately identical for every
+/// rejected path: echoing the resolved location (or the reason it failed)
+/// would keep the endpoint usable as a filesystem path oracle.
+fn ensure_within_models_root(
+    models_root: &Option<PathBuf>,
+    path: &std::path::Path,
+) -> Result<(), ApiError> {
+    let Some(root) = models_root.as_deref() else {
+        return Ok(());
+    };
+    let outside = || ApiError::bad_request("Model path is outside the configured models root");
+    // Fail closed when either side cannot be resolved; an unresolvable root
+    // (or path) admits nothing.
+    let Ok(resolved_root) = root.canonicalize() else {
+        return Err(outside());
+    };
+    let Ok(resolved) = path.canonicalize() else {
+        return Err(outside());
+    };
+    if !resolved.starts_with(&resolved_root) {
+        return Err(outside());
+    }
+    Ok(())
+}
+
 async fn load_model(
     State(state): State<ServerState>,
     Json(req): Json<ModelLoadRequest>,
@@ -1134,6 +1183,9 @@ async fn load_model(
     // Reject special files before the loader thread ever opens them: a FIFO
     // would block it forever and wedge every lifecycle endpoint.
     ensure_regular_model_file(&req.model)?;
+    // With a models root configured, only paths resolving inside it may be
+    // enqueued; the loader must not become a filesystem path oracle.
+    ensure_within_models_root(&state.server_config.models_root, &req.model)?;
     let engine = build_engine(&state.model_loader, req.model.clone(), config.clone()).await?;
     let snapshot = state
         .runtime
@@ -1158,6 +1210,14 @@ async fn reload_model(
     // The stored path was operator-supplied once; the file behind it may
     // since have been replaced by a FIFO or other special file.
     ensure_regular_model_file(&path)?;
+    // The same containment applies to reload: both the path it would load
+    // and the remembered last-installed path must live inside a configured
+    // models root (an initial `--model` outside the root must not make
+    // reload a bypass).
+    ensure_within_models_root(&state.server_config.models_root, &path)?;
+    if let Some(last_path) = current.last_path.as_deref() {
+        ensure_within_models_root(&state.server_config.models_root, last_path)?;
+    }
     let config = current.requested_config.clone();
     let engine = build_engine(&state.model_loader, path.clone(), config.clone()).await?;
     let snapshot = state
@@ -1184,6 +1244,13 @@ async fn unload_model(
     Ok(lifecycle_response("unloaded", &snapshot))
 }
 
+/// Absolute ceiling on a request-chosen context size. A crafted GGUF's own
+/// `context_length` combined with an attacker-chosen `ctx_size` otherwise
+/// sets an uncatchable OOM allocation target under overcommit (NS-4): the
+/// KV allocation happens on the loader thread where the kernel's OOM kill
+/// cannot be turned into an HTTP error.
+pub const MAX_CTX_SIZE: usize = 1_048_576;
+
 fn config_from_load_request(
     req: &ModelLoadRequest,
     mut config: InferenceConfig,
@@ -1191,6 +1258,11 @@ fn config_from_load_request(
     if let Some(ctx_size) = req.ctx_size {
         if ctx_size == 0 {
             return Err(ApiError::bad_request("ctx_size must be greater than 0"));
+        }
+        if ctx_size > MAX_CTX_SIZE {
+            return Err(ApiError::bad_request(format!(
+                "ctx_size is capped at {MAX_CTX_SIZE} tokens"
+            )));
         }
         config.max_seq_len = ctx_size;
     }
@@ -1256,6 +1328,7 @@ async fn health(State(state): State<ServerState>) -> Response {
         code,
         Json(serde_json::json!({
             "status": status,
+            "boot_id": state.boot_id,
             "model_loaded": snapshot.loaded,
             "model": snapshot.name,
             "active_sequences": stats.active,
@@ -1381,17 +1454,21 @@ async fn list_models(State(state): State<ServerState>) -> Json<serde_json::Value
 
 /// Start the API server
 pub async fn run_server(engine: InferenceEngine, host: &str, port: u16) -> anyhow::Result<()> {
-    run_server_with_config(engine, host, port, ServerConfig::default(), None).await
+    run_server_with_config(engine, host, port, ServerConfig::default(), None, None).await
 }
 
 /// Start the API server. Up to `engine.config.batch_size` sequences decode
-/// concurrently (see [`RuntimeOptions::from_batch_size`]).
+/// concurrently (see [`RuntimeOptions::from_batch_size`]). `stream_max_duration`
+/// bounds how long one admitted request may hold its stream slot (`None`
+/// keeps the default unbounded behavior).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_server_with_config(
     engine: InferenceEngine,
     host: &str,
     port: u16,
     server_config: ServerConfig,
     initial_model_path: Option<PathBuf>,
+    stream_max_duration: Option<Duration>,
 ) -> anyhow::Result<()> {
     let requested_config = engine.config.clone();
     run_server_with_requested_config(
@@ -1400,6 +1477,7 @@ pub async fn run_server_with_config(
         port,
         server_config,
         initial_model_path,
+        stream_max_duration,
         requested_config,
     )
     .await
@@ -1430,15 +1508,18 @@ async fn shutdown_signal() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_server_with_requested_config(
     engine: InferenceEngine,
     host: &str,
     port: u16,
     server_config: ServerConfig,
     initial_model_path: Option<PathBuf>,
+    stream_max_duration: Option<Duration>,
     requested_config: InferenceConfig,
 ) -> anyhow::Result<()> {
-    let options = RuntimeOptions::from_batch_size(engine.config.batch_size);
+    let mut options = RuntimeOptions::from_batch_size(engine.config.batch_size);
+    options.stream_max_duration = stream_max_duration;
     let max_active = options.max_active;
     let max_pending = options.max_pending;
     let state = ServerState::new_with_requested_config(
@@ -1757,6 +1838,7 @@ mod tests {
             max_pending,
             stream_buffer: 4,
             stream_stall_timeout: Duration::from_secs(60),
+            stream_max_duration: None,
             kv_page_size_tokens: 16,
         }
     }
@@ -1766,6 +1848,7 @@ mod tests {
             api_key: None,
             cors_origin: None,
             rate_limit_per_minute: None,
+            models_root: None,
         }
     }
 
@@ -3018,8 +3101,9 @@ mod tests {
         out.extend_from_slice(value.as_bytes());
     }
 
-    /// Write a small but complete F32 llama GGUF for the layered fixture.
-    fn write_tiny_gguf(name: &str, context: u32) -> tempfile::NamedTempFile {
+    /// Serialized bytes of a small but complete F32 llama GGUF for the
+    /// layered fixture.
+    fn tiny_gguf_bytes(name: &str, context: u32) -> Vec<u8> {
         let tensors = layered_tensors(11);
         let kv_u32 = [
             ("general.alignment", 32u32),
@@ -3069,8 +3153,24 @@ mod tests {
             }
             pad(&mut bytes);
         }
+        bytes
+    }
+
+    /// Write a tiny fixture GGUF at an operator-chosen path (used by the
+    /// models-root containment tests, which need files inside and outside a
+    /// specific directory).
+    fn write_tiny_gguf_at(path: &std::path::Path, name: &str, context: u32) {
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&tiny_gguf_bytes(name, context)).unwrap();
+        file.flush().unwrap();
+    }
+
+    /// Write a small but complete F32 llama GGUF for the layered fixture.
+    fn write_tiny_gguf(name: &str, context: u32) -> tempfile::NamedTempFile {
         let file = tempfile::Builder::new().suffix(".gguf").tempfile().unwrap();
-        file.as_file().write_all(&bytes).unwrap();
+        file.as_file()
+            .write_all(&tiny_gguf_bytes(name, context))
+            .unwrap();
         file.as_file().flush().unwrap();
         file
     }
@@ -3211,6 +3311,7 @@ mod tests {
             api_key: Some("secret".into()),
             cors_origin: None,
             rate_limit_per_minute: Some(2),
+            models_root: None,
         };
         let (base, _) = start(
             scripted_fixture("loop", &cycle("abc"), 16),
@@ -3339,5 +3440,272 @@ mod tests {
         );
         assert_eq!(health_status(true, true), ("ok", StatusCode::OK));
         assert_eq!(health_status(true, false), ("degraded", StatusCode::OK));
+    }
+
+    // ---------------------------------------------------------------------
+    // Lifecycle hardening gates (NS-4, S-2/NS-6, NS-7, T-F2)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn ctx_size_above_the_absolute_cap_is_rejected() {
+        // NS-4: a crafted GGUF context_length combined with an
+        // attacker-chosen ctx_size sets an uncatchable OOM allocation target
+        // on the loader thread (under overcommit the kernel OOM-kill cannot
+        // be turned into an HTTP error); the request layer must cap the
+        // value outright.
+        let request = |ctx_size: usize| {
+            serde_json::from_value::<ModelLoadRequest>(serde_json::json!({
+                "model": "m.gguf", "ctx_size": ctx_size,
+            }))
+            .unwrap()
+        };
+        let over = config_from_load_request(&request(MAX_CTX_SIZE + 1), InferenceConfig::default())
+            .unwrap_err();
+        assert_eq!(over.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(over.message(), "ctx_size is capped at 1048576 tokens");
+        // The boundary value itself stays accepted (positive control; the
+        // HTTP gate below exercises the same value end to end).
+        let config =
+            config_from_load_request(&request(MAX_CTX_SIZE), InferenceConfig::default()).unwrap();
+        assert_eq!(config.max_seq_len, MAX_CTX_SIZE);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_huge_ctx_size_is_rejected_and_the_cap_value_is_accepted() {
+        // NS-4 HTTP gate: the ceiling must answer 400 with the documented
+        // message before any allocation happens, and the cap value itself
+        // must still load (clamped by the model's own context_length).
+        let empty = InferenceEngine::new(Some(fixture_config(128)));
+        let (base, _state) = start(empty, options(2, 4), open_config()).await;
+        let http = client();
+        let file = write_tiny_gguf("capped", 64);
+
+        let response = http
+            .post(format!("{base}/v1/model/load"))
+            .json_body(&serde_json::json!({"model": file.path(), "ctx_size": 2_097_152}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        let error = response.json_value().await.unwrap();
+        assert_eq!(
+            error["error"]["message"],
+            "ctx_size is capped at 1048576 tokens"
+        );
+
+        let response = http
+            .post(format!("{base}/v1/model/load"))
+            .json_body(&serde_json::json!({"model": file.path(), "ctx_size": 1_048_576}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = response.json_value().await.unwrap();
+        assert_eq!(body["id"], "capped");
+        assert_eq!(body["max_seq_len"], 64, "clamped by the model context");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_exposes_a_stable_boot_id_across_polls() {
+        // T-F2: the epoch counter aliases across a full server restart (both
+        // processes start at epoch 0/1), so a desktop client watching model
+        // epochs cannot tell a restart from an in-process swap. /health must
+        // expose a boot identifier that is fixed for the life of one server
+        // state so the client can detect the restart.
+        let (base, _state) = start(layered_fixture("boot", 7), options(2, 4), open_config()).await;
+        let http = client();
+        let boot_id = || {
+            let http = http.clone();
+            let url = format!("{base}/health");
+            async move {
+                let health: serde_json::Value = http
+                    .get(&url)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json_value()
+                    .await
+                    .unwrap();
+                health["boot_id"].as_u64().expect("boot_id must be a u64")
+            }
+        };
+        let first = boot_id().await;
+        assert!(first > 0, "boot_id is derived from the UNIX epoch clock");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            boot_id().await,
+            first,
+            "boot_id must not change between polls"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn models_root_contains_load_and_reload_paths() {
+        // S-2/NS-6: /v1/model/load accepts arbitrary filesystem paths, which
+        // made it a path oracle (probe any path on the host) with limited
+        // GGUF content disclosure. With a models root configured, only paths
+        // that canonically resolve inside the root may reach the loader, and
+        // the rejection message must never echo the resolved location (that
+        // echo was the oracle).
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside_path = root.path().join("inside.gguf");
+        write_tiny_gguf_at(&inside_path, "inside-model", 64);
+        let outside_path = outside.path().join("outside.gguf");
+        write_tiny_gguf_at(&outside_path, "outside-model", 64);
+        let config = ServerConfig {
+            models_root: Some(root.path().to_path_buf()),
+            ..open_config()
+        };
+
+        let empty = InferenceEngine::new(Some(fixture_config(128)));
+        let (base, _state) = start(empty, options(2, 4), config.clone()).await;
+        let http = client();
+
+        // Inside the root: accepted.
+        let response = http
+            .post(format!("{base}/v1/model/load"))
+            .json_body(&serde_json::json!({"model": inside_path}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.json_value().await.unwrap()["id"], "inside-model");
+
+        // Outside the root: 400 without any path detail in the response.
+        let response = http
+            .post(format!("{base}/v1/model/load"))
+            .json_body(&serde_json::json!({"model": outside_path}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        let error = response.json_value().await.unwrap();
+        assert_eq!(
+            error["error"]["message"],
+            "Model path is outside the configured models root"
+        );
+        let raw = error.to_string();
+        let outside_display = outside_path.display().to_string();
+        assert!(
+            !raw.contains(&outside_display),
+            "the rejection must not echo the probed path"
+        );
+
+        // A symlink stored inside the root but pointing outside is caught
+        // by the canonicalize-based containment.
+        #[cfg(unix)]
+        {
+            let link = root.path().join("escape.gguf");
+            std::os::unix::fs::symlink(&outside_path, &link).unwrap();
+            let response = http
+                .post(format!("{base}/v1/model/load"))
+                .json_body(&serde_json::json!({"model": link}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400);
+            assert_eq!(
+                response.json_value().await.unwrap()["error"]["message"],
+                "Model path is outside the configured models root"
+            );
+        }
+
+        // Reload must not become a bypass: an engine installed from a path
+        // outside the root (e.g. an operator-supplied startup --model) is
+        // rejected when reload tries to reuse the remembered path.
+        let mut engine = InferenceEngine::new(Some(fixture_config(128)));
+        engine.load_model(&outside_path).unwrap();
+        let state = ServerState::new_with_requested_config(
+            engine,
+            Some(outside_path.clone()),
+            config,
+            options(2, 4),
+            fixture_config(128),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(serve(listener, state));
+        let response = http
+            .post(format!("{base}/v1/model/reload"))
+            .json_body(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json_value().await.unwrap()["error"]["message"],
+            "Model path is outside the configured models root"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_max_duration_fails_long_held_streams_and_frees_the_slot() {
+        // NS-7: the stall clock resets on every partial read, so a client
+        // that drips one byte every few seconds keeps a stream slot for
+        // hours (ctx x ~29 s per token stall window, measured). A wall-clock
+        // budget cannot be reset by reading; when it elapses the request
+        // must fail with an Internal error and the normal Remove path must
+        // free the slot and the KV pages. Default (None) is unchanged.
+        let engine = scripted_fixture("budget", &cycle("abcd"), 65_536);
+        let runtime = Arc::new(
+            Runtime::start(
+                engine,
+                None,
+                Arc::new(Scheduler::new(1)),
+                RuntimeOptions {
+                    stream_max_duration: Some(Duration::from_millis(20)),
+                    ..options(1, 4)
+                },
+            )
+            .unwrap(),
+        );
+        // The client keeps up with the deltas so the terminal error event is
+        // deliverable; the per-token full decode makes 60_000 tokens far
+        // outlast the 20 ms budget, so the budget — not generation — ends
+        // the stream.
+        let mut rx = runtime
+            .submit_stream(text_request("held", "a", 60_000))
+            .unwrap();
+        let mut failure = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::Started { .. } | StreamEvent::Delta(_) => {}
+                StreamEvent::Finished { .. } => {
+                    panic!("generation ended before the duration budget fired")
+                }
+                StreamEvent::Error(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            }
+        }
+        let err = failure.expect("the stream must fail with the duration error");
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.message, "Stream exceeded the maximum duration");
+        // The slot, queue and KV pages went back through the normal path.
+        wait_until("slot released", || runtime.stats().active == 0).await;
+        assert_eq!(runtime.stats().queued, 0);
+        wait_until("kv released", || runtime.scheduler().kv_page_stats().0 == 0).await;
+        assert_eq!(runtime.scheduler().stats().1, 0);
+
+        // Default None: unchanged behavior — an ordinary request completes.
+        let runtime = Arc::new(
+            Runtime::start(
+                scripted_fixture("budget", &cycle("abcd"), 64),
+                None,
+                Arc::new(Scheduler::new(1)),
+                options(1, 4),
+            )
+            .unwrap(),
+        );
+        let output = runtime
+            .submit(text_request("after", "a", 4))
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.text, "bcda");
     }
 }

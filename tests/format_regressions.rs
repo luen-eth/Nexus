@@ -294,6 +294,36 @@ fn stream_and_mmap_use_identical_metadata_widths_and_tensor_offset() {
 }
 
 #[test]
+fn a_header_claiming_more_metadata_than_the_file_holds_fails_cleanly() {
+    // NS-2 gate: the request-supplied model-load parse must read the file with
+    // bounded reads, never through a memory mapping. Before the fix the parser
+    // mapped the whole file and walked the claimed metadata straight out of the
+    // mapping, so a file truncated concurrently with the parse died with an
+    // UNCATCHABLE SIGBUS — a signal, not a panic, which no catch_unwind (and
+    // therefore no API error path) can intercept — taking the whole server
+    // down. With bounded read_exact-style reads the same condition must
+    // surface as a clean Err the handler can report.
+    let mut b = header(1, 8);
+    // Only two of the eight claimed KV entries actually exist.
+    for i in 0..2 {
+        string(&mut b, &format!("present.{i}"));
+        b.extend_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(&(i as u32).to_le_bytes());
+    }
+    // Shrink the file after building it: the header still claims eight
+    // entries but the bytes for the remaining six are gone, so the parser
+    // must hit EOF exactly at the start of the third key.
+    let truncated_len = b.len() as u64;
+    tensor(&mut b, "w", &[1], 0, 0);
+    pad(&mut b);
+    b.extend_from_slice(&42f32.to_le_bytes());
+    let f = file(&b);
+    f.as_file().set_len(truncated_len).unwrap();
+    let err = GgufReader::parse_file(f.path()).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::UnexpectedEof, "{err}");
+}
+
+#[test]
 fn malformed_headers_and_layouts_never_panic() {
     let mut b = header(1, 0);
     tensor(&mut b, "w", &[1], 0, 0);

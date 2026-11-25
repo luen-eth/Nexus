@@ -68,6 +68,20 @@ struct Cli {
     /// headers are ignored). Also configurable through NEXUS_RATE_LIMIT_PER_MINUTE.
     #[arg(long, env = "NEXUS_RATE_LIMIT_PER_MINUTE")]
     rate_limit_per_minute: Option<usize>,
+
+    /// Optional root directory that /v1/model/load (and reload) paths must
+    /// live under; outside paths are rejected without path details. Also
+    /// configurable through NEXUS_MODELS_ROOT. Unset keeps the loopback
+    /// single-tenant default.
+    #[arg(long, env = "NEXUS_MODELS_ROOT")]
+    models_root: Option<PathBuf>,
+
+    /// Maximum wall-clock seconds one admitted request may hold a stream
+    /// slot before it is failed with an Internal error; 0 disables the bound.
+    /// The stall timeout only catches silent clients, not ones that reset it
+    /// with partial reads.
+    #[arg(long)]
+    stream_max_duration: Option<u64>,
 }
 
 #[tokio::main]
@@ -125,6 +139,21 @@ async fn main() -> Result<()> {
     // Store the trimmed secret: clients send the exact key, and a
     // trailing-space paste must not silently change what clients must send.
     cli.api_key = cli.api_key.map(|key| key.trim().to_string());
+    // Canonicalize the models root once at startup so every later
+    // containment check compares canonical paths; a root that cannot be
+    // resolved admits nothing, so refuse to start with it.
+    let models_root = match cli.models_root {
+        Some(root) => Some(
+            root.canonicalize()
+                .map_err(|err| anyhow!("--models-root {}: {err}", root.display()))?,
+        ),
+        None => None,
+    };
+    // 0 is the documented "disabled" value for the stream duration budget.
+    let stream_max_duration = cli
+        .stream_max_duration
+        .filter(|seconds| *seconds > 0)
+        .map(std::time::Duration::from_secs);
 
     let config = InferenceConfig {
         max_seq_len: cli.ctx_size,
@@ -176,6 +205,7 @@ async fn main() -> Result<()> {
         api_key: cli.api_key,
         cors_origin: cli.cors_origin,
         rate_limit_per_minute: cli.rate_limit_per_minute,
+        models_root,
     };
 
     // Start server
@@ -185,6 +215,7 @@ async fn main() -> Result<()> {
         cli.port,
         server_config,
         cli.model,
+        stream_max_duration,
         config,
     )
     .await?;

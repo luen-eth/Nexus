@@ -773,7 +773,8 @@ impl InferenceEngine {
         if let Some(reason) = self.backend.failure_reason() {
             return Err(io::Error::new(io::ErrorKind::Unsupported, reason));
         }
-        // Parse GGUF header and tensor metadata with mmap-backed parser.
+        // Parse GGUF header and tensor metadata with bounded file reads; the
+        // parser never mmaps the (request-supplied) model file.
         let metadata = GgufReader::parse_file(model_path)?;
 
         let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);

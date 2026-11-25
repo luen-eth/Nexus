@@ -1009,13 +1009,24 @@ impl GgufReader {
         &self.tensors
     }
 
-    /// Parse a GGUF file from a path using memory mapping
+    /// Parse a GGUF file from a path with bounded reads.
+    ///
+    /// Model paths are request-supplied on the API server, so the parse must
+    /// never touch a memory mapping of the file: a mapping over a file that
+    /// another process truncates concurrently faults with SIGBUS, which no
+    /// `catch_unwind` can intercept — the whole server dies. The
+    /// header/metadata/tensor-table section is instead read from the file with
+    /// `read_exact`-style reads bounded by [`MAX_HEADER_BYTES`] (a truncated
+    /// file surfaces as a plain `UnexpectedEof` error), and tensor payloads
+    /// keep their own seek+read path in [`GgufReader::read_tensor_bytes`].
     pub fn parse_file<P: AsRef<Path>>(path: P) -> io::Result<ModelMetadata> {
         let file = File::open(path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(io::Error::other)?;
-
+        let file_len = file.metadata()?.len();
+        let mut buffered = io::BufReader::new(file);
         let mut reader = GgufReader::new();
-        reader.parse_from_bytes(&mmap)
+        let metadata = reader.parse(&mut buffered)?;
+        metadata.validate_tensor_layout(file_len)?;
+        Ok(metadata)
     }
 
     /// Read raw tensor bytes from a GGUF file using parsed metadata.
@@ -1260,13 +1271,6 @@ impl GgufReader {
             }
         }
         Ok(output)
-    }
-
-    /// Parse GGUF from a byte slice (memory-mapped data)
-    fn parse_from_bytes(&mut self, data: &[u8]) -> io::Result<ModelMetadata> {
-        let metadata = self.parse(&mut io::Cursor::new(data))?;
-        metadata.validate_tensor_layout(data.len() as u64)?;
-        Ok(metadata)
     }
 }
 

@@ -34,7 +34,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utilities
 anyhow = "1.0.103"
-memmap2 = "0.9.11"
 dirs = "5.0"
 num_cpus = "1.16"
 libc = "0.2"

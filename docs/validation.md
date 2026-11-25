@@ -1,6 +1,6 @@
 # Validation and compatibility
 
-This document describes the November 2026 correctness and optimization work. Nexus is still an inference prototype. The tests below cover the stated formats and LLaMA execution path; passing them does not establish support for every GGUF model, production workload or GPU.
+This document describes the November 2026 correctness and optimization work. Nexus is still an inference prototype. The tests below cover the stated formats and the LLaMA and Mistral execution paths; passing them does not establish support for every GGUF model, production workload or GPU.
 
 ## Correctness changes
 
@@ -12,9 +12,9 @@ This document describes the November 2026 correctness and optimization work. Nex
 | Model loading | Required tensors, supported RoPE and tokenizer validated; failed replacement preserves the previous model; no synthetic fallback |
 | Tokenization | Embedded HF pipeline or native GGUF vocabulary; special tokens, chat templates, EOS/EOT, stop text and UTF-8 stream handling |
 | Sessions | Independent KV cache and RNG; context and token budgets checked; no unused final forward pass |
-| HTTP runtime | Bounded worker/stream queues, disconnect cleanup, atomic model lifecycle, model identity checked at submission and admission |
+| HTTP runtime | Bounded worker/stream queues, disconnect cleanup, atomic model lifecycle, model identity checked at submission and admission; new submissions during a model swap fail fast with 503 and `Retry-After`; stop payloads capped at 16 sequences of 1 KiB; CORS headers only with an explicit origin; a rate limit of 0 means unlimited; SIGTERM/SIGINT stop accepting and drain in a bounded 25 s window measured from the signal; tokenizer render/decode/stop-scan run under a panic guard that fails the single request, never the worker; regular-file-only model paths (FIFOs rejected); `completion_tokens` includes the stop tail per the llama.cpp/OpenAI convention |
 | Scheduling | Requests that fit can bypass an oversized pending request, with an eight-bypass aging limit to prevent indefinite starvation |
-| Downloads | Temporary output, advertised-length verification, propagated errors and URL/size/SHA-256 cache receipts; cancellation cleanup; CLI preserves owner/repository, nested filenames and the requested output directory |
+| Downloads | Temporary output, advertised-length verification, propagated errors and URL/size/SHA-256 cache receipts; cancellation cleanup; CLI preserves owner/repository, nested filenames and the requested output directory; the CLI catalog lists only llama/mistral single-file GGUFs |
 | Memory accounting | Live/peak reservation accounting separated from host weight and session KV payload bytes |
 
 The format fixtures use synthetic values, not redistributed trained weights. See [fixture provenance](../tests/fixtures/format/README.md) and [reference generation instructions](../tests/reference/README.txt).

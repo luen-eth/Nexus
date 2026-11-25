@@ -75,6 +75,7 @@ impl TestServer {
                 api_key: None,
                 cors_origin: None,
                 rate_limit_per_minute: None,
+                models_root: None,
             },
         )
         .await
@@ -434,6 +435,7 @@ async fn an_empty_configured_api_key_never_authorizes_an_empty_client_key() {
             api_key: Some(String::new()),
             cors_origin: None,
             rate_limit_per_minute: None,
+            models_root: None,
         },
     )
     .await;
@@ -477,6 +479,7 @@ async fn bearer_scheme_matching_is_case_insensitive() {
             api_key: Some("s3cret".into()),
             cors_origin: None,
             rate_limit_per_minute: None,
+            models_root: None,
         },
     )
     .await;
@@ -551,6 +554,7 @@ async fn cors_headers_require_an_explicit_origin() {
             api_key: None,
             cors_origin: Some("https://example.test".into()),
             rate_limit_per_minute: None,
+            models_root: None,
         },
     )
     .await;
@@ -614,6 +618,7 @@ async fn a_whitespace_api_key_is_never_a_livable_secret() {
                 api_key: Some(bad_key.into()),
                 cors_origin: None,
                 rate_limit_per_minute: None,
+                models_root: None,
             },
         )
         .await;

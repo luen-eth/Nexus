@@ -238,6 +238,20 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(self.panel.messages, [])
         self.assertIsNone(self.panel.last_stats)
 
+    def test_a_server_restart_changes_the_identity_and_clears_the_chat(self):
+        # T-F2: a restarted server process restarts its epoch counter, so
+        # epochs alone cannot detect a full restart; the health boot_id can.
+        self.send()
+        self.assertTrue(self.panel._history)
+        self.controller.health["boot_id"] = 111
+        self.controller.changed.emit()
+        self.assertEqual(self.panel.messages, [])
+        self.assertEqual(self.panel._history, [])
+        # A stable boot_id must not re-clear the conversation.
+        self.send()
+        self.controller.changed.emit()
+        self.assertTrue(self.panel._history)
+
     def test_failed_model_operation_preserves_history_and_a_new_epoch_clears_it(self):
         self.send()
         self.assertTrue(self.panel._history)

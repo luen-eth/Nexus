@@ -56,6 +56,11 @@ pub struct RuntimeOptions {
     pub stream_buffer: usize,
     /// A stream whose client has not drained its buffer for this long is cancelled.
     pub stream_stall_timeout: Duration,
+    /// Maximum wall-clock time an admitted request may hold its stream slot.
+    /// `None` (the default) leaves the slot bound only by `max_tokens` and
+    /// the stall timeout; a client that resets the stall clock with partial
+    /// reads would otherwise keep a slot for hours.
+    pub stream_max_duration: Option<Duration>,
     /// Tokens per KV page for scheduler accounting.
     pub kv_page_size_tokens: usize,
 }
@@ -77,6 +82,12 @@ impl RuntimeOptions {
         self.max_pending = self.max_pending.max(1);
         self.stream_buffer = self.stream_buffer.max(MIN_STREAM_BUFFER);
         self.kv_page_size_tokens = self.kv_page_size_tokens.max(1);
+        // A zero duration is the documented "disabled" value (`0` on the
+        // CLI); normalize it to the off state instead of failing every job
+        // the instant it is admitted.
+        self.stream_max_duration = self
+            .stream_max_duration
+            .filter(|duration| !duration.is_zero());
         self
     }
 }
@@ -88,6 +99,7 @@ impl Default for RuntimeOptions {
             max_pending: 16,
             stream_buffer: 16,
             stream_stall_timeout: Duration::from_secs(30),
+            stream_max_duration: None,
             kv_page_size_tokens: 16,
         }
     }
@@ -817,6 +829,8 @@ struct ActiveSeq {
     id: String,
     session: GenerationSession,
     reply: Reply,
+    /// Admit time; bounds the total slot hold when `stream_max_duration` is set.
+    started: Instant,
     /// Text already delivered to a streaming client.
     sent_text: String,
     stalled_since: Option<Instant>,
@@ -1057,6 +1071,7 @@ impl Worker {
             id: request.id,
             session,
             reply,
+            started: Instant::now(),
             sent_text: String::new(),
             stalled_since: None,
             stop_strings: request.stop,
@@ -1193,6 +1208,26 @@ impl Worker {
     fn step_one(&mut self, index: usize) -> StepOutcome {
         let stall_timeout = self.shared.options.stream_stall_timeout;
         let seq = &mut self.active[index];
+
+        if let Some(max_duration) = self.shared.options.stream_max_duration {
+            // NS-7: the stall clock resets on every partial read, so a client
+            // that drips one byte every few seconds holds a slot for hours.
+            // The wall-clock budget cannot be reset by reading slowly; when
+            // it elapses the request fails and the Remove path below frees
+            // the slot and its KV pages like any other termination.
+            if seq.started.elapsed() >= max_duration {
+                tracing::warn!(
+                    "Failing request {}: exceeded the maximum stream duration {:?}",
+                    seq.id,
+                    max_duration
+                );
+                take_reply(&mut seq.reply).fail(RuntimeError::new(
+                    RuntimeErrorKind::Internal,
+                    "Stream exceeded the maximum duration",
+                ));
+                return StepOutcome::Remove;
+            }
+        }
 
         if seq.reply.is_closed() {
             self.shared.cancelled_total.fetch_add(1, Ordering::SeqCst);

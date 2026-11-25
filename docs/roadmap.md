@@ -1,6 +1,6 @@
 # Engineering plan
 
-The current release establishes a checked LLaMA inference path, CPU/CUDA numerical regressions, strict format handling, bounded HTTP scheduling and a Linux desktop controller. This plan describes remaining work; it does not imply that the features already exist.
+The current release establishes a checked LLaMA and Mistral inference path, CPU/CUDA numerical regressions, strict format handling, bounded HTTP scheduling and a Linux desktop controller. This plan describes remaining work; it does not imply that the features already exist.
 
 | Priority | Work | Prerequisite | Acceptance evidence |
 | --- | --- | --- | --- |
